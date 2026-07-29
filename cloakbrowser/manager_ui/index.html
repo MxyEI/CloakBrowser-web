@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>CloakBrowser 环境管理</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">C</span>
+        <span>CloakBrowser</span>
+      </div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" type="button">
+          <span class="nav-icon" aria-hidden="true">▦</span>
+          浏览器环境
+        </button>
+      </nav>
+      <div class="local-indicator">
+        <span class="status-dot"></span>
+        本地管理服务
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <h1>浏览器环境</h1>
+        </div>
+        <button class="button primary" id="createButton" type="button">
+          <span aria-hidden="true">＋</span>
+          新建环境
+        </button>
+      </header>
+
+      <section class="summary-band" aria-label="环境概览">
+        <div class="summary-item">
+          <span class="summary-label">全部环境</span>
+          <strong id="totalCount">0</strong>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">运行中</span>
+          <strong id="runningCount">0</strong>
+        </div>
+        <div class="summary-item">
+          <span class="summary-label">已配置代理</span>
+          <strong id="proxyCount">0</strong>
+        </div>
+      </section>
+
+      <section class="manager-panel">
+        <div class="toolbar">
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input id="searchInput" type="search" placeholder="搜索名称、分组、标签、代理或 seed" autocomplete="off">
+          </label>
+          <label class="group-filter">
+            <span class="visually-hidden">分组筛选</span>
+            <select id="groupFilter" aria-label="分组筛选">
+              <option value="all">全部分组</option>
+            </select>
+          </label>
+          <div class="segmented" role="group" aria-label="状态筛选">
+            <button class="active" type="button" data-filter="all">全部</button>
+            <button type="button" data-filter="running">运行中</button>
+            <button type="button" data-filter="stopped">已停止</button>
+          </div>
+          <div class="batch-controls" aria-label="批量操作">
+            <label class="batch-select">
+              <input id="selectVisibleInput" type="checkbox">
+              <span id="selectionCount">全选当前</span>
+            </label>
+            <button class="batch-button" id="batchLaunchButton" type="button">启动选中</button>
+            <button class="batch-button" id="batchStopButton" type="button">停止选中</button>
+          </div>
+          <div class="transfer-controls" aria-label="导入导出">
+            <button class="batch-button" id="importButton" type="button">导入</button>
+            <input id="importFileInput" type="file" accept="application/json,.json" hidden>
+            <div class="export-wrap">
+              <button class="batch-button" id="exportButton" type="button" aria-haspopup="menu" aria-expanded="false">导出选中</button>
+              <div class="row-menu export-menu" id="exportMenu" role="menu" hidden>
+                <button type="button" data-export-proxy="false">安全导出</button>
+                <button type="button" data-export-proxy="true">包含代理凭据</button>
+              </div>
+            </div>
+          </div>
+          <button class="icon-button" id="refreshButton" type="button" title="刷新" aria-label="刷新环境列表">↻</button>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>环境</th>
+                <th>状态</th>
+                <th>Fingerprint</th>
+                <th>代理</th>
+                <th>最近启动</th>
+                <th class="actions-heading">操作</th>
+              </tr>
+            </thead>
+            <tbody id="profileRows"></tbody>
+          </table>
+          <div class="empty-state" id="emptyState" hidden>
+            <div class="empty-mark">＋</div>
+            <h2 id="emptyTitle">还没有浏览器环境</h2>
+            <button class="button secondary" id="emptyCreateButton" type="button">新建环境</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="profileModal" hidden>
+    <section class="modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header class="modal-header">
+        <div>
+          <span class="modal-kicker" id="modalKicker">新环境</span>
+          <h2 id="modalTitle">新建浏览器环境</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-modal title="关闭" aria-label="关闭">×</button>
+      </header>
+
+      <form id="profileForm">
+        <input type="hidden" id="profileId">
+        <div class="form-section">
+          <h3>基本信息</h3>
+          <div class="form-grid">
+            <label class="field field-wide">
+              <span>环境名称</span>
+              <input id="nameInput" name="name" required maxlength="80" placeholder="例如：客户 A - 主账号">
+            </label>
+            <label class="field">
+              <span>分组</span>
+              <input id="groupInput" name="group" maxlength="50" list="groupOptions" placeholder="例如：客户 A">
+              <datalist id="groupOptions"></datalist>
+            </label>
+            <label class="field">
+              <span>标签</span>
+              <input id="tagsInput" name="tags" maxlength="249" placeholder="主账号, 电商, 美国">
+            </label>
+            <label class="field">
+              <span>Fingerprint seed</span>
+              <span class="input-action">
+                <input id="seedInput" name="fingerprint_seed" type="number" min="1" max="2147483647" required>
+                <button id="generateSeedButton" type="button" title="生成新 seed" aria-label="生成新 fingerprint seed">↻</button>
+              </span>
+            </label>
+            <label class="field">
+              <span>启动页面</span>
+              <input id="startupUrlInput" name="startup_url" type="url" placeholder="about:blank">
+            </label>
+            <div class="seed-preview field-wide" id="seedPreview">
+              <div class="seed-preview-heading">
+                <div>
+                  <strong>Seed 指纹预览</strong>
+                  <span id="seedPreviewStatus">等待采集</span>
+                </div>
+                <button class="icon-button" id="previewSeedButton" type="button" title="重新采集指纹预览" aria-label="重新采集指纹预览">↻</button>
+              </div>
+              <dl class="fingerprint-grid seed-preview-grid" id="seedPreviewRows"></dl>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <h3>网络与地区</h3>
+          <div class="form-grid">
+            <label class="field field-wide">
+              <span>代理 URL <small id="currentProxy"></small></span>
+              <span class="input-action proxy-action">
+                <select id="proxySchemeInput" aria-label="代理协议">
+                  <option value="http">HTTP</option>
+                  <option value="https">HTTPS</option>
+                  <option value="socks5">SOCKS5</option>
+                  <option value="socks5h">SOCKS5H</option>
+                </select>
+                <input id="proxyInput" name="proxy" type="password" autocomplete="new-password" placeholder="user:password@host:port">
+                <button id="toggleProxyButton" type="button">显示</button>
+                <button id="checkProxyButton" type="button">检测代理</button>
+              </span>
+            </label>
+            <div class="proxy-result field-wide" id="proxyResult" hidden>
+              <span class="status-dot"></span>
+              <span>出口 IP</span>
+              <strong id="proxyResultIp"></strong>
+              <span class="proxy-change" id="proxyChange"></span>
+            </div>
+            <label class="switch-field field-wide proxy-lock-control">
+              <span>锁定代理出口 IP</span>
+              <input id="lockProxyIpInput" name="lock_proxy_ip" type="checkbox">
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+            <div class="proxy-lock-state field-wide" id="proxyLockState" hidden>
+              <span>锁定 IP</span>
+              <strong id="lockedProxyIp"></strong>
+              <button id="acceptProxyIpButton" type="button" hidden>接受当前 IP</button>
+            </div>
+            <label class="checkbox-field field-wide" id="clearProxyField" hidden>
+              <input id="clearProxyInput" type="checkbox">
+              <span>移除当前代理</span>
+            </label>
+            <label class="field">
+              <span>时区</span>
+              <select id="timezoneInput" name="timezone">
+                <option value="">自动匹配 / 浏览器默认</option>
+                <option value="America/New_York">美国东部 - New York</option>
+                <option value="America/Chicago">美国中部 - Chicago</option>
+                <option value="America/Denver">美国山地 - Denver</option>
+                <option value="America/Phoenix">美国山地 - Phoenix</option>
+                <option value="America/Los_Angeles">美国太平洋 - Los Angeles</option>
+                <option value="America/Anchorage">美国阿拉斯加 - Anchorage</option>
+                <option value="Pacific/Honolulu">美国夏威夷 - Honolulu</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>地理位置</span>
+              <select id="locationInput" name="location">
+                <option value="">浏览器默认</option>
+                <option value="new-york" data-timezone="America/New_York">New York, NY</option>
+                <option value="chicago" data-timezone="America/Chicago">Chicago, IL</option>
+                <option value="denver" data-timezone="America/Denver">Denver, CO</option>
+                <option value="phoenix" data-timezone="America/Phoenix">Phoenix, AZ</option>
+                <option value="los-angeles" data-timezone="America/Los_Angeles">Los Angeles, CA</option>
+                <option value="anchorage" data-timezone="America/Anchorage">Anchorage, AK</option>
+                <option value="honolulu" data-timezone="Pacific/Honolulu">Honolulu, HI</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>语言</span>
+              <select id="localeInput" name="locale">
+                <option value="">自动匹配 / 浏览器默认</option>
+                <option value="en-US">English (United States)</option>
+                <option value="en-GB">English (United Kingdom)</option>
+                <option value="zh-CN">中文（简体）</option>
+                <option value="zh-TW">中文（繁體）</option>
+              </select>
+            </label>
+            <label class="checkbox-field field-wide">
+              <input id="geoipInput" name="geoip" type="checkbox">
+              <span>根据代理出口自动匹配时区、语言和 WebRTC IP</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-section advanced-section">
+          <details id="advancedFingerprintPanel">
+            <summary>
+              <span>高级指纹</span>
+              <small id="advancedFingerprintSummary">Seed 自动生成</small>
+            </summary>
+            <div class="form-grid advanced-grid">
+              <label class="field">
+                <span>平台身份</span>
+                <select id="fingerprintPlatformInput" name="fingerprint_platform">
+                  <option value="">Seed 默认（推荐）</option>
+                  <option value="macos">macOS</option>
+                  <option value="windows">Windows</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>浏览器品牌</span>
+                <select id="fingerprintBrandInput" name="fingerprint_brand">
+                  <option value="">Seed 默认（Chrome）</option>
+                  <option value="Chrome">Chrome</option>
+                  <option value="Edge">Microsoft Edge</option>
+                  <option value="Opera">Opera</option>
+                  <option value="Vivaldi">Vivaldi</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>浏览器版本</span>
+                <input id="fingerprintBrandVersionInput" name="fingerprint_brand_version" inputmode="numeric" maxlength="40" pattern="[0-9]{1,3}(\.[0-9]{1,7}){0,3}" placeholder="Seed 默认">
+              </label>
+              <label class="field">
+                <span>系统版本</span>
+                <input id="fingerprintPlatformVersionInput" name="fingerprint_platform_version" inputmode="numeric" maxlength="40" pattern="[0-9]{1,3}(\.[0-9]{1,7}){0,3}" placeholder="Seed 默认">
+              </label>
+              <label class="field">
+                <span>CPU 线程</span>
+                <select id="hardwareConcurrencyInput" name="hardware_concurrency">
+                  <option value="0">Seed 默认</option>
+                  <option value="2">2</option>
+                  <option value="4">4</option>
+                  <option value="8">8</option>
+                  <option value="12">12</option>
+                  <option value="16">16</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>设备内存</span>
+                <select id="deviceMemoryInput" name="device_memory_gb">
+                  <option value="0">Seed 默认</option>
+                  <option value="2">2 GB</option>
+                  <option value="4">4 GB</option>
+                  <option value="8">8 GB</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>屏幕分辨率</span>
+                <select id="screenSizeInput" name="screen_size">
+                  <option value="">Seed 默认</option>
+                  <option value="1366x768">1366 × 768</option>
+                  <option value="1440x900">1440 × 900</option>
+                  <option value="1536x864">1536 × 864</option>
+                  <option value="1920x1080">1920 × 1080</option>
+                  <option value="2560x1440">2560 × 1440</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>任务栏高度</span>
+                <select id="taskbarHeightInput" name="taskbar_height">
+                  <option value="-1">平台默认</option>
+                  <option value="0">0 px</option>
+                  <option value="40">40 px</option>
+                  <option value="48">48 px</option>
+                  <option value="95">95 px</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>GPU Vendor</span>
+                <input id="gpuVendorInput" name="gpu_vendor" maxlength="160" placeholder="Seed 默认">
+              </label>
+              <label class="field">
+                <span>GPU Renderer</span>
+                <input id="gpuRendererInput" name="gpu_renderer" maxlength="240" placeholder="Seed 默认">
+              </label>
+              <label class="switch-field">
+                <span>指纹噪声</span>
+                <input id="fingerprintNoiseInput" name="fingerprint_noise" type="checkbox" checked>
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+              <label class="switch-field">
+                <span>第三方 Cookie（148+）</span>
+                <input id="allowThirdPartyCookiesInput" name="allow_third_party_cookies" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+              <div class="advanced-warning field-wide" id="advancedFingerprintWarning" hidden></div>
+            </div>
+          </details>
+        </div>
+
+        <div class="form-section">
+          <h3>运行设置</h3>
+          <div class="form-grid compact-grid">
+            <label class="field">
+              <span>存储配额（MB）</span>
+              <input id="quotaInput" name="storage_quota_mb" type="number" min="256" max="500000" value="5000">
+            </label>
+            <div class="toggle-stack">
+              <label class="switch-field">
+                <span>无头模式</span>
+                <input id="headlessInput" name="headless" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+              <label class="switch-field">
+                <span>行为拟真</span>
+                <input id="humanizeInput" name="humanize" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+            </div>
+            <label class="field field-wide">
+              <span>备注</span>
+              <textarea id="notesInput" name="notes" maxlength="500" rows="3" placeholder="账号用途、负责人或其他内部信息"></textarea>
+            </label>
+          </div>
+        </div>
+
+        <footer class="modal-footer">
+          <button class="button secondary" type="button" data-close-modal>取消</button>
+          <button class="button primary" id="saveButton" type="submit">创建环境</button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="modal-backdrop" id="confirmModal" hidden>
+    <section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <h2 id="confirmTitle">删除环境</h2>
+      <p id="confirmText"></p>
+      <footer class="modal-footer">
+        <button class="button secondary" id="cancelDeleteButton" type="button">取消</button>
+        <button class="button danger" id="confirmDeleteButton" type="button">删除环境</button>
+      </footer>
+    </section>
+  </div>
+
+  <div class="modal-backdrop" id="fingerprintModal" hidden>
+    <section class="modal fingerprint-modal" role="dialog" aria-modal="true" aria-labelledby="fingerprintTitle">
+      <header class="modal-header">
+        <div>
+          <span class="modal-kicker">环境指纹</span>
+          <h2 id="fingerprintTitle">指纹详情</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-fingerprint title="关闭" aria-label="关闭">×</button>
+      </header>
+      <div class="fingerprint-section">
+        <div class="fingerprint-section-heading">
+          <h3>配置参数</h3>
+        </div>
+        <dl class="fingerprint-grid" id="fingerprintConfigRows"></dl>
+      </div>
+      <div class="fingerprint-section">
+        <div class="fingerprint-section-heading">
+          <h3>浏览器实际值</h3>
+          <span id="fingerprintCaptureStatus">尚未采集</span>
+        </div>
+        <dl class="fingerprint-grid" id="fingerprintActualRows"></dl>
+      </div>
+      <footer class="modal-footer">
+        <button class="button secondary" type="button" data-close-fingerprint>关闭</button>
+      </footer>
+    </section>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

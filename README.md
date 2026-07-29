@@ -96,6 +96,71 @@ const browser = await launch({
 
 See [Troubleshooting](#troubleshooting) for site-specific issues (FingerprintJS, Kasada, reCAPTCHA).
 
+## Browser Environment Manager
+
+CloakBrowser includes a local management interface for creating and reusing
+browser environments. Each environment keeps its fingerprint seed, persistent
+browser data directory, proxy, timezone/locale settings, and launch options
+together.
+
+```bash
+cloakbrowser manager
+```
+
+The command opens `http://127.0.0.1:8765`. You can create, edit, clone, launch,
+stop, search, batch start/stop, test proxy connectivity, and delete environments
+from the interface. Environments can be organized with groups and tags, filtered,
+selected, and started or stopped as a chosen batch. A successful proxy test
+saves the latest observed exit IP on
+the environment so unexpected IP changes are visible. Environments can also lock
+that exit IP: every launch verifies the proxy before opening Chromium, blocks an
+unexpected IP, and lets you explicitly accept the latest observed IP. Deleted environments are
+moved to `~/.cloakbrowser/manager/_trash` instead of being permanently removed.
+Proxy credentials are stored in local profile files with restricted permissions
+and are masked in the management API.
+
+Selected environments can be exported as JSON and imported into another manager
+data directory. Safe export is the default and removes proxy URLs; choose the
+explicit credential export only when the destination also needs the proxy login.
+Exports preserve fingerprint seeds and environment settings, but intentionally
+exclude browser data, cookies, runtime state, and local filesystem paths.
+
+The environment editor accepts HTTP, HTTPS, SOCKS5, and SOCKS5H proxies and
+offers the primary US IANA timezones and city geolocation presets. Manual timezone
+and geolocation settings work without a proxy, and the language selector includes
+US and UK English. GeoIP automatic matching is
+disabled when no proxy is configured. Saved settings take effect the next time the
+environment starts. After an environment starts, its Fingerprint Details view shows
+the actual navigator, screen, viewport, WebGL, timezone, and storage values reported
+by that browser session. The create/edit form can also launch an isolated temporary
+preview for the selected seed and display its generated UA, platform, hardware,
+screen, WebGL, timezone, and language before the environment is saved.
+
+The Advanced Fingerprint section keeps seed-generated values as the default and
+allows per-environment overrides for the reported platform, browser brand and
+version, platform version, CPU threads, device memory, screen size, GPU strings,
+taskbar height, fingerprint noise, and third-party cookie compatibility. Overrides
+are applied identically to the temporary preview and the saved browser environment;
+the editor warns about incomplete GPU pairs and obvious host/platform conflicts.
+
+Useful options:
+
+```bash
+cloakbrowser manager --no-open
+cloakbrowser manager --port 9000
+cloakbrowser manager --data-dir /path/to/manager-data
+```
+
+Automatic timezone, locale, and WebRTC matching requires the GeoIP extra:
+
+```bash
+pip install "cloakbrowser[geoip]"
+```
+
+The manager only accepts loopback addresses. It is not intended to be exposed
+directly to a LAN or the public internet because its data directory contains
+browser sessions and proxy credentials.
+
 ## Install
 
 **Python:**

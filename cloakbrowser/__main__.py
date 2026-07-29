@@ -618,6 +618,10 @@ def main() -> None:
     sub.add_parser("update", help="Check for and download a newer binary")
     sub.add_parser("clear-cache", help="Remove all cached binaries")
 
+    from .profile_manager import add_manager_parser, cmd_manager
+
+    add_manager_parser(sub)
+
     login_p = sub.add_parser(
         "login", help="Save a license key (or get a free key via GitHub)"
     )
@@ -639,6 +643,7 @@ def main() -> None:
         "doctor": cmd_info,
         "update": cmd_update,
         "clear-cache": cmd_clear_cache,
+        "manager": cmd_manager,
         "login": cmd_login,
         "logout": cmd_logout,
     }
