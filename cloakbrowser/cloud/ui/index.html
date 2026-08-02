@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloakBrowser Cloud</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <main class="auth-shell" id="authShell" hidden>
+    <section class="auth-panel" aria-labelledby="authTitle">
+      <div class="brand-line">
+        <span class="brand-mark" aria-hidden="true">CB</span>
+        <div>
+          <strong>CloakBrowser</strong>
+          <span>Cloud Console</span>
+        </div>
+      </div>
+      <div class="segmented auth-tabs" role="tablist" aria-label="认证方式">
+        <button id="loginTab" type="button" role="tab" aria-selected="true">登录</button>
+        <button id="registerTab" type="button" role="tab" aria-selected="false">注册</button>
+      </div>
+      <form id="loginForm">
+        <h1 id="authTitle">登录团队空间</h1>
+        <label class="field">
+          <span>邮箱</span>
+          <input name="email" type="email" autocomplete="email" maxlength="254" required>
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="current-password" maxlength="128" required>
+        </label>
+        <button class="button primary auth-submit" type="submit">登录</button>
+      </form>
+      <form id="registerForm" hidden>
+        <h1>创建团队空间</h1>
+        <div class="auth-grid">
+          <label class="field">
+            <span>姓名</span>
+            <input name="display_name" autocomplete="name" maxlength="80" required>
+          </label>
+          <label class="field">
+            <span>团队名称</span>
+            <input name="organization_name" maxlength="100" required>
+          </label>
+        </div>
+        <label class="field">
+          <span>邮箱</span>
+          <input name="email" type="email" autocomplete="email" maxlength="254" required>
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required>
+        </label>
+        <button class="button primary auth-submit" type="submit">创建账号</button>
+      </form>
+      <p class="form-error" id="authError" role="alert" hidden></p>
+    </section>
+  </main>
+
+  <div class="app-shell" id="appShell" hidden>
+    <header class="topbar">
+      <div class="brand-line compact">
+        <span class="brand-mark" aria-hidden="true">CB</span>
+        <div>
+          <strong>CloakBrowser</strong>
+          <span>Cloud</span>
+        </div>
+      </div>
+      <div class="team-switcher">
+        <label for="organizationSelect">团队</label>
+        <select id="organizationSelect"></select>
+        <button class="icon-button" id="createOrganizationButton" type="button" title="创建团队" aria-label="创建团队">+</button>
+      </div>
+      <div class="account-area">
+        <span id="currentUser"></span>
+        <button class="button secondary small" id="logoutButton" type="button">退出</button>
+      </div>
+    </header>
+
+    <nav class="workspace-tabs" aria-label="工作区">
+      <button type="button" data-view="environments" aria-current="page">环境</button>
+      <button type="button" data-view="groups">分组</button>
+      <button type="button" data-view="members">团队</button>
+      <button type="button" data-view="extensions">扩展</button>
+      <button type="button" data-view="agents">节点</button>
+      <button type="button" data-view="tasks">任务</button>
+      <button type="button" data-view="audit">审计</button>
+    </nav>
+
+    <main class="workspace">
+      <section class="view" id="environmentsView">
+        <header class="view-header">
+          <div>
+            <span class="view-kicker">Browser environments</span>
+            <h1>浏览器环境</h1>
+          </div>
+          <button class="button primary" id="createEnvironmentButton" type="button">新建环境</button>
+        </header>
+        <div class="filterbar">
+          <input id="environmentSearch" type="search" placeholder="搜索名称或标签" aria-label="搜索环境">
+          <select id="environmentGroupFilter" aria-label="按分组筛选"></select>
+          <span id="environmentCount"></span>
+        </div>
+        <div class="table-wrap environment-table-wrap">
+          <table class="environment-table">
+            <thead><tr><th>环境</th><th>分组</th><th>存储</th><th>运行状态</th><th>Revision</th><th>更新时间</th><th></th></tr></thead>
+            <tbody id="environmentRows"></tbody>
+          </table>
+          <div class="empty-state" id="environmentEmpty" hidden>暂无环境</div>
+        </div>
+      </section>
+
+      <section class="view" id="groupsView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Organization</span><h1>环境分组</h1></div>
+          <button class="button primary" id="createGroupButton" type="button">新建分组</button>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>名称</th><th>说明</th><th>环境数</th><th>更新时间</th><th></th></tr></thead>
+            <tbody id="groupRows"></tbody>
+          </table>
+          <div class="empty-state" id="groupEmpty" hidden>暂无分组</div>
+        </div>
+      </section>
+
+      <section class="view" id="membersView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Access control</span><h1>团队成员</h1></div>
+          <button class="button primary" id="addMemberButton" type="button">添加成员</button>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>成员</th><th>邮箱</th><th>角色</th><th>加入时间</th><th></th></tr></thead>
+            <tbody id="memberRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view" id="extensionsView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Managed packages</span><h1>扩展程序</h1></div>
+          <button class="button primary" id="createExtensionButton" type="button">上传扩展</button>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>扩展</th><th>版本</th><th>状态</th><th>大小</th><th>环境数</th><th>上传时间</th><th></th></tr></thead>
+            <tbody id="extensionRows"></tbody>
+          </table>
+          <div class="empty-state" id="extensionEmpty" hidden>暂无扩展包</div>
+        </div>
+      </section>
+
+      <section class="view" id="agentsView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Execution nodes</span><h1>执行节点</h1></div>
+          <button class="button primary" id="createAgentButton" type="button">注册节点</button>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>节点</th><th>状态</th><th>主机</th><th>版本</th><th>租约</th><th>最后心跳</th><th></th></tr></thead>
+            <tbody id="agentRows"></tbody>
+          </table>
+          <div class="empty-state" id="agentEmpty" hidden>暂无执行节点</div>
+        </div>
+      </section>
+
+      <section class="view" id="tasksView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Remote operations</span><h1>远程任务</h1></div>
+          <button class="button secondary" id="refreshTasksButton" type="button">刷新</button>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>任务</th><th>环境</th><th>节点</th><th>状态</th><th>创建时间</th><th>完成时间</th></tr></thead>
+            <tbody id="taskRows"></tbody>
+          </table>
+          <div class="empty-state" id="taskEmpty" hidden>暂无远程任务</div>
+        </div>
+      </section>
+
+      <section class="view" id="auditView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Security events</span><h1>审计日志</h1></div>
+          <button class="button secondary" id="refreshAuditButton" type="button">刷新</button>
+        </header>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时间</th><th>操作</th><th>目标</th><th>操作人</th></tr></thead>
+            <tbody id="auditRows"></tbody>
+          </table>
+          <div class="empty-state" id="auditEmpty" hidden>暂无审计记录</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="environment-dialog" id="environmentDialog">
+    <form id="environmentForm" method="dialog">
+      <header class="dialog-header"><div><span>Environment</span><h2 id="environmentDialogTitle">新建环境</h2></div><button class="icon-button" type="button" data-close-dialog="environmentDialog" aria-label="关闭">×</button></header>
+      <input id="environmentId" type="hidden">
+      <input id="environmentRevision" type="hidden">
+      <div class="dialog-body environment-editor">
+        <section class="environment-form-section">
+          <h3>基本信息</h3>
+          <div class="form-grid">
+            <label class="field field-wide"><span>环境名称</span><input id="environmentName" maxlength="100" placeholder="例如：客户 A - 主账号" required></label>
+            <label class="field"><span>分组</span><select id="environmentGroup"></select></label>
+            <label class="field"><span>标签</span><input id="environmentTags" maxlength="400" placeholder="主账号, 电商, 美国"></label>
+            <label class="field"><span>Fingerprint seed</span><span class="input-action"><input id="environmentSeed" type="number" min="1" max="2147483647" required><button class="icon-button" id="generateCloudSeedButton" type="button" title="生成新 Seed" aria-label="生成新 Seed">↻</button></span></label>
+            <label class="field"><span>启动页面</span><input id="environmentStartupUrl" type="url" maxlength="2048" placeholder="about:blank"></label>
+          </div>
+        </section>
+
+        <section class="environment-form-section">
+          <h3>云端数据</h3>
+          <div class="form-grid">
+            <label class="field field-wide"><span>存储策略</span><select id="environmentStorage"><option value="local">仅本地</option><option value="backup">加密云端备份</option><option value="shared">团队共享</option></select></label>
+            <p class="form-notice field-wide" id="storagePolicyNotice" hidden>浏览器关闭后将加密上传最新数据；下次启动会先恢复云端版本。上传失败时节点本地数据仍会保留。</p>
+            <fieldset class="extension-picker field-wide">
+              <legend>扩展程序</legend>
+              <div id="environmentExtensions"></div>
+            </fieldset>
+          </div>
+        </section>
+
+        <section class="environment-form-section">
+          <h3>网络与地区</h3>
+          <div class="form-grid">
+            <label class="field field-wide">
+              <span>代理 URL</span>
+              <span class="input-action proxy-action">
+                <select id="environmentProxyScheme" aria-label="代理协议"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option><option value="socks5h">SOCKS5H</option></select>
+                <input id="environmentProxy" type="password" autocomplete="new-password" maxlength="2048" placeholder="user:password@host:port">
+                <button id="toggleEnvironmentProxyButton" type="button">显示</button>
+              </span>
+              <small id="environmentCurrentProxy"></small>
+            </label>
+            <div class="toggle-row field-wide">
+              <label class="toggle" id="environmentClearProxyField"><input id="environmentClearProxy" type="checkbox"><span>清除现有代理</span></label>
+              <label class="toggle"><input id="environmentGeoip" type="checkbox"><span>根据代理出口自动匹配时区、语言和 WebRTC IP</span></label>
+            </div>
+            <label class="field"><span>时区</span><select id="environmentTimezone"><option value="">自动匹配 / 浏览器默认</option><option value="America/New_York">美国东部 - New York</option><option value="America/Chicago">美国中部 - Chicago</option><option value="America/Denver">美国山地 - Denver</option><option value="America/Phoenix">美国山地 - Phoenix</option><option value="America/Los_Angeles">美国太平洋 - Los Angeles</option><option value="America/Anchorage">美国阿拉斯加 - Anchorage</option><option value="Pacific/Honolulu">美国夏威夷 - Honolulu</option><option value="Asia/Shanghai">Asia/Shanghai</option><option value="Europe/London">Europe/London</option></select></label>
+            <label class="field"><span>地理位置</span><select id="environmentLocation"><option value="">浏览器默认</option><option value="new-york" data-timezone="America/New_York">New York, NY</option><option value="chicago" data-timezone="America/Chicago">Chicago, IL</option><option value="denver" data-timezone="America/Denver">Denver, CO</option><option value="phoenix" data-timezone="America/Phoenix">Phoenix, AZ</option><option value="los-angeles" data-timezone="America/Los_Angeles">Los Angeles, CA</option><option value="anchorage" data-timezone="America/Anchorage">Anchorage, AK</option><option value="honolulu" data-timezone="Pacific/Honolulu">Honolulu, HI</option></select></label>
+            <label class="field field-wide"><span>语言</span><select id="environmentLocale"><option value="">自动匹配 / 浏览器默认</option><option value="en-US">English (United States)</option><option value="en-GB">English (United Kingdom)</option><option value="zh-CN">中文（简体）</option><option value="zh-TW">中文（繁體）</option></select></label>
+          </div>
+        </section>
+
+        <section class="environment-form-section advanced-section">
+          <details id="environmentAdvancedFingerprint">
+            <summary><span>高级指纹</span><small id="environmentAdvancedSummary">Seed 自动生成</small></summary>
+            <div class="form-grid advanced-grid">
+              <label class="field"><span>平台身份</span><select id="environmentFingerprintPlatform"><option value="">Seed 默认（推荐）</option><option value="macos">macOS</option><option value="windows">Windows</option></select></label>
+              <label class="field"><span>浏览器品牌</span><select id="environmentFingerprintBrand"><option value="">Seed 默认（Chrome）</option><option value="Chrome">Chrome</option><option value="Edge">Microsoft Edge</option><option value="Opera">Opera</option><option value="Vivaldi">Vivaldi</option></select></label>
+              <label class="field"><span>浏览器版本</span><input id="environmentFingerprintBrandVersion" inputmode="numeric" maxlength="40" pattern="[0-9]{1,3}(\.[0-9]{1,7}){0,3}" placeholder="Seed 默认"></label>
+              <label class="field"><span>系统版本</span><input id="environmentFingerprintPlatformVersion" inputmode="numeric" maxlength="40" pattern="[0-9]{1,3}(\.[0-9]{1,7}){0,3}" placeholder="Seed 默认"></label>
+              <label class="field"><span>CPU 线程</span><select id="environmentHardwareConcurrency"><option value="0">Seed 默认</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="12">12</option><option value="16">16</option></select></label>
+              <label class="field"><span>设备内存</span><select id="environmentDeviceMemory"><option value="0">Seed 默认</option><option value="1">1 GB</option><option value="2">2 GB</option><option value="4">4 GB</option><option value="8">8 GB</option></select></label>
+              <label class="field"><span>屏幕分辨率</span><select id="environmentScreenSize"><option value="">Seed 默认</option><option value="1366x768">1366 × 768</option><option value="1440x900">1440 × 900</option><option value="1536x864">1536 × 864</option><option value="1920x1080">1920 × 1080</option><option value="2560x1440">2560 × 1440</option></select></label>
+              <label class="field"><span>任务栏高度</span><select id="environmentTaskbarHeight"><option value="-1">平台默认</option><option value="0">0 px</option><option value="40">40 px</option><option value="48">48 px</option><option value="95">95 px</option></select></label>
+              <label class="field"><span>GPU Vendor</span><input id="environmentGpuVendor" maxlength="160" placeholder="Seed 默认"></label>
+              <label class="field"><span>GPU Renderer</span><input id="environmentGpuRenderer" maxlength="240" placeholder="Seed 默认"></label>
+              <div class="toggle-row field-wide">
+                <label class="toggle"><input id="environmentFingerprintNoise" type="checkbox" checked><span>指纹噪声</span></label>
+                <label class="toggle"><input id="environmentAllowThirdPartyCookies" type="checkbox"><span>第三方 Cookie（Chromium 148+）</span></label>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="environment-form-section">
+          <h3>运行设置</h3>
+          <div class="form-grid compact-grid">
+            <label class="field"><span>存储配额（MB）</span><input id="environmentStorageQuota" type="number" min="256" max="500000" value="5000" required></label>
+            <div class="toggle-row runtime-toggles">
+              <label class="toggle"><input id="environmentHeadless" type="checkbox"><span>无头模式</span></label>
+              <label class="toggle"><input id="environmentHumanize" type="checkbox"><span>行为拟真</span></label>
+            </div>
+          </div>
+        </section>
+
+        <div class="consistency-warning" id="environmentConsistencyWarning" role="status" aria-live="polite" hidden></div>
+        <p class="form-error environment-form-error" id="environmentError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="environmentDialog">取消</button><button class="button primary" type="submit">保存环境</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="extensionDialog">
+    <form id="extensionForm" method="dialog">
+      <header class="dialog-header"><div><span>Extension package</span><h2>上传扩展</h2></div><button class="icon-button" type="button" data-close-dialog="extensionDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body form-grid">
+        <label class="field"><span>扩展名称</span><input id="extensionName" maxlength="100" required></label>
+        <label class="field"><span>版本</span><input id="extensionVersion" maxlength="40" placeholder="1.0.0" required></label>
+        <label class="field field-wide"><span>ZIP 文件</span><input id="extensionFile" type="file" accept=".zip,application/zip" required></label>
+        <p class="form-error field-wide" id="extensionError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="extensionDialog">取消</button><button class="button primary" type="submit">上传</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="groupDialog">
+    <form id="groupForm" method="dialog">
+      <header class="dialog-header"><div><span>Group</span><h2>新建分组</h2></div><button class="icon-button" type="button" data-close-dialog="groupDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="field"><span>分组名称</span><input id="groupName" maxlength="80" required></label>
+        <label class="field"><span>说明</span><textarea id="groupDescription" maxlength="300" rows="3"></textarea></label>
+        <p class="form-error" id="groupError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="groupDialog">取消</button><button class="button primary" type="submit">创建分组</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="memberDialog">
+    <form id="memberForm" method="dialog">
+      <header class="dialog-header"><div><span>Member</span><h2>添加团队成员</h2></div><button class="icon-button" type="button" data-close-dialog="memberDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="field"><span>注册邮箱</span><input id="memberEmail" type="email" maxlength="254" required></label>
+        <label class="field"><span>角色</span><select id="memberRole"><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option><option value="owner">Owner</option></select></label>
+        <p class="form-error" id="memberError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="memberDialog">取消</button><button class="button primary" type="submit">添加成员</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="organizationDialog">
+    <form id="organizationForm" method="dialog">
+      <header class="dialog-header"><div><span>Organization</span><h2>创建团队</h2></div><button class="icon-button" type="button" data-close-dialog="organizationDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body"><label class="field"><span>团队名称</span><input id="organizationName" maxlength="100" required></label><p class="form-error" id="organizationError" role="alert" hidden></p></div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="organizationDialog">取消</button><button class="button primary" type="submit">创建团队</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="agentDialog">
+    <form id="agentForm" method="dialog">
+      <header class="dialog-header"><div><span>Agent</span><h2>注册执行节点</h2></div><button class="icon-button" type="button" data-close-dialog="agentDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="field"><span>节点名称</span><input id="agentName" maxlength="100" required></label>
+        <p class="form-error" id="agentError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="agentDialog">取消</button><button class="button primary" type="submit">注册节点</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="launchDialog">
+    <form id="launchForm" method="dialog">
+      <header class="dialog-header"><div><span>Remote launch</span><h2 id="launchDialogTitle">启动环境</h2></div><button class="icon-button" type="button" data-close-dialog="launchDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="field"><span>执行节点</span><select id="launchAgent" required></select></label>
+        <p class="form-error" id="launchError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="launchDialog">取消</button><button class="button primary" type="submit">启动</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="token-dialog" id="agentTokenDialog">
+    <form method="dialog">
+      <header class="dialog-header"><div><span>Credential</span><h2>Agent Token</h2></div><button class="icon-button" value="default" aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="field"><span>节点密钥</span><textarea id="agentTokenValue" rows="4" readonly></textarea></label>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" id="copyAgentTokenButton" type="button">复制</button><button class="button primary" value="default">完成</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="confirm-dialog" id="confirmDialog">
+    <form method="dialog">
+      <header class="dialog-header"><div><span>Confirm</span><h2 id="confirmTitle">确认操作</h2></div></header>
+      <div class="dialog-body"><p id="confirmMessage"></p></div>
+      <footer class="dialog-footer"><button class="button secondary" value="cancel">取消</button><button class="button danger" id="confirmButton" value="default">确认</button></footer>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

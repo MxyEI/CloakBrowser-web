@@ -841,17 +841,30 @@ tbody tr.selected {
   padding: 2px 0 20px;
 }
 
-.advanced-warning {
-  min-height: 34px;
-  padding: 8px 11px;
+.consistency-warning {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 16px 24px 0;
+  padding: 10px 12px;
   border-left: 3px solid var(--warning);
   background: #fff9ee;
   color: #815d22;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
-.advanced-warning[hidden] {
+.consistency-warning strong {
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.consistency-warning span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.consistency-warning[hidden] {
   display: none;
 }
 
@@ -1524,6 +1537,11 @@ tbody tr.selected {
   .form-section,
   .modal-header {
     padding-inline: 18px;
+  }
+
+  .consistency-warning {
+    grid-template-columns: 1fr;
+    margin-inline: 18px;
   }
 
   .confirm-dialog {

@@ -619,8 +619,12 @@ def main() -> None:
     sub.add_parser("clear-cache", help="Remove all cached binaries")
 
     from .profile_manager import add_manager_parser, cmd_manager
+    from .cloud.agent_cli import add_agent_parser, cmd_agent
+    from .cloud.cli import add_cloud_parser, cmd_cloud
 
     add_manager_parser(sub)
+    add_cloud_parser(sub)
+    add_agent_parser(sub)
 
     login_p = sub.add_parser(
         "login", help="Save a license key (or get a free key via GitHub)"
@@ -644,6 +648,8 @@ def main() -> None:
         "update": cmd_update,
         "clear-cache": cmd_clear_cache,
         "manager": cmd_manager,
+        "cloud": cmd_cloud,
+        "agent": cmd_agent,
         "login": cmd_login,
         "logout": cmd_logout,
     }

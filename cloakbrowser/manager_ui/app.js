@@ -28,6 +28,7 @@ const state = {
   previewLoading: false,
   previewQueued: false,
   previewGeneration: 0,
+  previewDetails: null,
 };
 
 const elements = {
@@ -75,7 +76,7 @@ const elements = {
   geoip: document.querySelector("#geoipInput"),
   advancedFingerprintPanel: document.querySelector("#advancedFingerprintPanel"),
   advancedFingerprintSummary: document.querySelector("#advancedFingerprintSummary"),
-  advancedFingerprintWarning: document.querySelector("#advancedFingerprintWarning"),
+  consistencyWarning: document.querySelector("#consistencyWarning"),
   fingerprintPlatform: document.querySelector("#fingerprintPlatformInput"),
   fingerprintBrand: document.querySelector("#fingerprintBrandInput"),
   fingerprintBrandVersion: document.querySelector("#fingerprintBrandVersionInput"),
@@ -489,15 +490,109 @@ function updateAdvancedFingerprintState() {
   elements.gpuVendor.required = hasGpuOverride;
   elements.gpuRenderer.required = hasGpuOverride;
 
+  updateConsistencyWarnings();
+}
+
+function gpuFamily(value) {
+  if (/apple/i.test(value)) return "Apple";
+  if (/nvidia|geforce|quadro/i.test(value)) return "NVIDIA";
+  if (/\bamd\b|radeon|ati technologies/i.test(value)) return "AMD";
+  if (/intel/i.test(value)) return "Intel";
+  return "";
+}
+
+function currentConsistencyConfig() {
+  return {
+    ...advancedFingerprintPayload(),
+    timezone: elements.timezone.value,
+    location: elements.location.value,
+    locale: elements.locale.value,
+    geoip: elements.geoip.checked,
+    storage_quota_mb: Number(elements.quota.value || 0),
+  };
+}
+
+function previewMismatchLabels(config, details) {
+  if (!details) return [];
+  const mismatches = [];
+  const actualPlatform = String(details.platform || "");
+  if (config.fingerprint_platform === "windows" && !/win/i.test(actualPlatform)) mismatches.push("平台");
+  if (config.fingerprint_platform === "macos" && !/mac/i.test(actualPlatform)) mismatches.push("平台");
+  if (config.timezone && details.timezone && config.timezone !== details.timezone) mismatches.push("时区");
+  if (config.locale && details.language && config.locale.toLowerCase() !== String(details.language).toLowerCase()) mismatches.push("语言");
+  if (config.hardware_concurrency && config.hardware_concurrency !== Number(details.hardware_concurrency)) mismatches.push("CPU 线程");
+  if (config.device_memory_gb && config.device_memory_gb !== Number(details.device_memory_gb)) mismatches.push("设备内存");
+
+  const screen = details.screen || {};
+  if (config.screen_width && (
+    config.screen_width !== Number(screen.width) || config.screen_height !== Number(screen.height)
+  )) mismatches.push("屏幕分辨率");
+  if (config.taskbar_height >= 0 && screen.height != null && screen.avail_height != null
+      && config.taskbar_height !== Number(screen.height) - Number(screen.avail_height)) {
+    mismatches.push("任务栏高度");
+  }
+
+  const comparableText = (value) => String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
+  if (config.gpu_vendor && comparableText(config.gpu_vendor) !== comparableText(details.webgl_vendor)) mismatches.push("GPU Vendor");
+  if (config.gpu_renderer && comparableText(config.gpu_renderer) !== comparableText(details.webgl_renderer)) mismatches.push("GPU Renderer");
+
+  if (config.storage_quota_mb && details.storage_quota_mb != null) {
+    const quotaDifference = Math.abs(config.storage_quota_mb - Number(details.storage_quota_mb));
+    if (quotaDifference > Math.max(32, config.storage_quota_mb * 0.02)) mismatches.push("存储配额");
+  }
+
+  const brandTokens = { Chrome: "Chrome", Edge: "Edg", Opera: "OPR", Vivaldi: "Vivaldi" };
+  const brandToken = brandTokens[config.fingerprint_brand];
+  if (brandToken) {
+    const escapedToken = brandToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(`${escapedToken}/([0-9.]+)`).exec(String(details.user_agent || ""));
+    if (!match) mismatches.push("浏览器品牌");
+    else if (config.fingerprint_brand_version && match[1] !== config.fingerprint_brand_version) mismatches.push("浏览器版本");
+  }
+  return [...new Set(mismatches)];
+}
+
+function collectConsistencyWarnings(details = state.previewDetails) {
+  const config = currentConsistencyConfig();
   const warnings = [];
+
+  const locationTimezone = elements.location.selectedOptions[0]?.dataset.timezone || "";
+  if (config.location && config.timezone && locationTimezone && config.timezone !== locationTimezone) {
+    warnings.push(`所选城市对应 ${locationTimezone}，与当前时区 ${config.timezone} 不一致`);
+  }
+  if (config.geoip && (config.timezone || config.locale || config.location)) {
+    warnings.push("GeoIP 自动匹配与手动地区设置同时启用，手动值会优先；请确认它们与代理出口一致");
+  }
+
+  const hostIsMac = /Mac/i.test(navigator.platform || "");
+  const effectivePlatform = config.fingerprint_platform || (hostIsMac ? "macos" : "windows");
+  if (config.fingerprint_platform === "windows" && hostIsMac) {
+    warnings.push("当前宿主为 macOS，Windows 身份可能与系统字体和图形特征不一致");
+  }
+  if (config.fingerprint_platform === "macos" && !hostIsMac) {
+    warnings.push("当前宿主不是 macOS，macOS 身份可能与系统字体和图形特征不一致");
+  }
+
+  const hasGpuOverride = Boolean(config.gpu_vendor || config.gpu_renderer);
   if (hasGpuOverride && (!config.gpu_vendor || !config.gpu_renderer)) {
     warnings.push("GPU Vendor 和 Renderer 必须同时设置");
   }
-  if (config.fingerprint_platform === "windows" && /apple/i.test(config.gpu_vendor)) {
+  if (effectivePlatform === "windows" && /apple/i.test(config.gpu_vendor)) {
     warnings.push("Windows 平台不应搭配 Apple GPU");
   }
-  if (config.fingerprint_platform === "windows" && /Mac/i.test(navigator.platform || "")) {
-    warnings.push("当前宿主为 macOS，Windows 身份可能与系统字体和图形特征不一致");
+  const vendorFamily = gpuFamily(config.gpu_vendor);
+  const rendererFamily = gpuFamily(config.gpu_renderer);
+  if (vendorFamily && rendererFamily && vendorFamily !== rendererFamily) {
+    warnings.push(`GPU Vendor 属于 ${vendorFamily}，Renderer 却属于 ${rendererFamily}`);
+  }
+  if (effectivePlatform === "windows" && config.taskbar_height === 95) {
+    warnings.push("Windows 身份使用了更常见于 macOS 的 95 px 任务栏高度");
+  }
+  if (effectivePlatform === "macos" && [40, 48].includes(config.taskbar_height)) {
+    warnings.push("macOS 身份使用了更常见于 Windows 的任务栏高度");
+  }
+  if (config.storage_quota_mb && config.storage_quota_mb < 1024) {
+    warnings.push("存储配额低于 1 GB，部分站点可能将环境判断为隐私模式");
   }
   if (!config.fingerprint_noise) {
     warnings.push("指纹噪声已关闭");
@@ -505,8 +600,21 @@ function updateAdvancedFingerprintState() {
   if (config.allow_third_party_cookies) {
     warnings.push("第三方 Cookie 兼容开关需要 Chromium 148+");
   }
-  elements.advancedFingerprintWarning.hidden = warnings.length === 0;
-  elements.advancedFingerprintWarning.textContent = warnings.join("；");
+
+  const previewMismatches = previewMismatchLabels(config, details);
+  if (previewMismatches.length) {
+    warnings.push(`指纹预览未按设置生效：${previewMismatches.join("、")}`);
+  }
+  return warnings;
+}
+
+function updateConsistencyWarnings(details = state.previewDetails) {
+  const warnings = collectConsistencyWarnings(details);
+  elements.consistencyWarning.hidden = warnings.length === 0;
+  elements.consistencyWarning.replaceChildren(
+    textElement("strong", "", "配置一致性提醒"),
+    textElement("span", "", warnings.join("；")),
+  );
 }
 
 function fingerprintPreviewPayload() {
@@ -557,6 +665,8 @@ function renderSeedPreview(details = null, status = "等待采集", error = fals
 
 function scheduleFingerprintPreview(delay = 500) {
   window.clearTimeout(state.previewTimer);
+  state.previewDetails = null;
+  updateConsistencyWarnings();
   renderSeedPreview(null, "等待刷新");
   state.previewTimer = window.setTimeout(previewFingerprint, delay);
 }
@@ -587,12 +697,16 @@ async function previewFingerprint() {
       body: JSON.stringify(payload),
     });
     if (generation === state.previewGeneration && signature === fingerprintPreviewSignature()) {
+      state.previewDetails = result.details;
+      updateConsistencyWarnings(result.details);
       renderSeedPreview(result.details, `实测 · ${formatTime(result.details.captured_at)}`);
     } else {
       state.previewQueued = true;
     }
   } catch (error) {
     if (generation === state.previewGeneration && signature === fingerprintPreviewSignature()) {
+      state.previewDetails = null;
+      updateConsistencyWarnings();
       renderSeedPreview(null, error.message, true);
     }
   } finally {
@@ -643,7 +757,6 @@ function openProfileModal(profile = null) {
   elements.fingerprintNoise.checked = profile?.fingerprint_noise ?? true;
   elements.allowThirdPartyCookies.checked = profile?.allow_third_party_cookies ?? false;
   elements.advancedFingerprintPanel.open = advancedOverrideCount(advancedFingerprintPayload()) > 0;
-  updateAdvancedFingerprintState();
   elements.headless.checked = profile?.headless ?? false;
   elements.humanize.checked = profile?.humanize ?? false;
   elements.quota.value = profile?.storage_quota_mb || 5000;
@@ -653,6 +766,8 @@ function openProfileModal(profile = null) {
   const captured = profile?.fingerprint_details && Object.keys(profile.fingerprint_details).length
     ? profile.fingerprint_details
     : null;
+  state.previewDetails = captured;
+  updateAdvancedFingerprintState();
   renderSeedPreview(captured, captured ? `最近实测 · ${formatTime(captured.captured_at)}` : "等待采集");
   elements.modalKicker.textContent = profile ? "环境设置" : "新环境";
   elements.modalTitle.textContent = profile ? "编辑浏览器环境" : "新建浏览器环境";
@@ -668,6 +783,7 @@ function closeProfileModal() {
   state.previewTimer = null;
   state.previewGeneration += 1;
   state.previewQueued = false;
+  state.previewDetails = null;
   elements.profileModal.hidden = true;
   document.body.style.overflow = "";
   state.editingId = null;
@@ -1034,6 +1150,7 @@ elements.seed.addEventListener("input", () => scheduleFingerprintPreview());
 elements.timezone.addEventListener("change", () => scheduleFingerprintPreview(250));
 elements.locale.addEventListener("change", () => scheduleFingerprintPreview(250));
 elements.quota.addEventListener("change", () => scheduleFingerprintPreview(250));
+elements.geoip.addEventListener("change", () => updateConsistencyWarnings());
 [
   elements.fingerprintPlatform,
   elements.fingerprintBrand,
@@ -1091,6 +1208,7 @@ elements.proxyInput.addEventListener("input", () => {
   elements.proxyResult.hidden = true;
   elements.proxyChange.textContent = "";
   syncGeoipAvailability();
+  updateConsistencyWarnings();
 });
 elements.clearProxy.addEventListener("change", () => {
   if (elements.clearProxy.checked) {
@@ -1100,11 +1218,13 @@ elements.clearProxy.addEventListener("change", () => {
     renderProxyLockState();
   }
   syncGeoipAvailability();
+  updateConsistencyWarnings();
 });
 elements.location.addEventListener("change", (event) => {
   const timezone = event.target.selectedOptions[0]?.dataset.timezone;
   if (timezone) setTimezoneValue(timezone);
   if (event.target.value && !elements.locale.value) setLocaleValue("en-US");
+  updateConsistencyWarnings();
   scheduleFingerprintPreview(250);
 });
 document.querySelectorAll("[data-close-modal]").forEach((button) => {

@@ -978,7 +978,11 @@ def test_manager_ui_exposes_profile_management_controls():
     assert 'id="screenSizeInput"' in html
     assert 'id="gpuVendorInput"' in html
     assert 'id="fingerprintNoiseInput"' in html
+    assert 'id="consistencyWarning"' in html
     assert "advancedFingerprintPayload" in javascript
+    assert "collectConsistencyWarnings" in javascript
+    assert "previewMismatchLabels" in javascript
+    assert "GeoIP 自动匹配与手动地区设置同时启用" in javascript
     assert "renderFingerprintDetails" in javascript
     assert "profilesSignature" in javascript
     assert "hasOpenProfileMenu" in javascript

@@ -161,6 +161,105 @@ The manager only accepts loopback addresses. It is not intended to be exposed
 directly to a LAN or the public internet because its data directory contains
 browser sessions and proxy credentials.
 
+## Cloud Team Console (Preview)
+
+The Python package includes a cloud control plane for shared environment
+configuration and remote browser execution. It provides account registration,
+secure session login, multiple teams, role-based access, groups, execution-node
+registration, optimistic environment revision checks, remote task history, and
+organization-scoped audit logs.
+
+See [Cloud Team Console Implementation Record](CLOUD-IMPLEMENTATION.md) for the
+implemented data model, security invariants, verification record, and remaining
+production work.
+
+```bash
+pip install "cloakbrowser[cloud]"
+cloakbrowser cloud
+```
+
+The local development console opens at `http://127.0.0.1:8777` and stores its
+SQLite database under `~/.cloakbrowser/cloud`. The existing local manager and
+its `browser-data` directories remain separate. Environments can be launched on
+an online Agent from the console and stopped from the same environment table.
+Launch and stop requests are claimed with short-lived task credentials, and the
+console shows pending, running, successful, and failed task states.
+
+Roles are enforced by the API, not only by the interface: Owners control the
+organization, Admins manage members/groups/environments/Agents, Operators can
+create and edit environments, and Viewers have read-only access. Every environment
+update carries an expected revision, so one team member cannot silently
+overwrite another member's newer edit.
+
+Owners and Admins can register an execution node from the Nodes view. The raw
+Agent token is returned once and only its SHA-256-derived digest is stored by the
+server. Start the heartbeat client with that token supplied by a secret manager
+or an owner-only token file:
+
+```bash
+export CLOAKBROWSER_AGENT_TOKEN='cb_agent_...'
+cloakbrowser agent --cloud-url http://127.0.0.1:8777
+```
+
+The Agent stores browser profiles under its local CloakBrowser cache directory;
+use `--data-dir` to choose a different owner-controlled location. Each cloud
+environment gets an isolated persistent Chromium user-data directory, preserving
+cookies, LocalStorage, IndexedDB, cache, service workers, extension state, and
+history across launches on that Agent. The Agent protocol uses exclusive
+60-second leases. Lease renewal and release require a separate lease secret plus
+a monotonically increasing fencing token, so an expired process cannot overwrite
+a newer owner. The CLI refuses non-loopback plain HTTP URLs so Agent credentials
+cannot be sent to a remote server without TLS.
+
+The `backup` and `shared` storage policies synchronize the complete browser
+user-data directory after Chromium has closed and restore the latest snapshot
+before Chromium starts on another Agent. Snapshot payloads use a separate
+AES-256-GCM key per environment. The server stores that key only in an encrypted
+envelope and stores the browser snapshot as ciphertext; an Agent can obtain the
+key or transfer content only while it holds the environment's current lease.
+Version checks and lease fencing prevent an expired Agent from overwriting newer
+state. If an upload fails, the Agent records the local copy as unsynchronized and
+retries it before the next launch. If both that local copy and the cloud version
+changed, launch stops with a conflict instead of discarding either copy.
+
+The default limit is 1 GiB per encrypted snapshot and 100 GiB of current
+snapshots per organization. Configure them with
+`CLOAKBROWSER_CLOUD_MAX_SNAPSHOT_MB` and
+`CLOAKBROWSER_CLOUD_ORG_SNAPSHOT_QUOTA_MB`. The server creates
+`snapshot-master.key` with owner-only permissions in its data directory. For a
+multi-instance deployment, all instances must receive the same 32-byte URL-safe
+base64 key through `CLOAKBROWSER_CLOUD_SNAPSHOT_KEY`; losing that key makes the
+stored environment keys and snapshots unrecoverable. Back up the key separately
+from the snapshot object directory.
+
+Owner and Admin users can upload immutable Chromium extension ZIP packages and
+assign them to environments. The control plane validates each archive, manifest,
+size, and SHA-256 digest; Agents download packages only while holding the current
+environment lease, validate them again, and cache safely unpacked copies by
+package ID and digest. Proxy credentials are encrypted with the same cloud master
+key boundary, masked in management responses, and released only as an in-memory
+runtime asset to the current Agent lease. They are never included in task payloads
+or audit details, and Agent launch errors redact the URL and credentials.
+Extension packages default to 100 MiB each and 5 GiB per organization. Configure
+those limits with `CLOAKBROWSER_CLOUD_MAX_EXTENSION_MB` and
+`CLOAKBROWSER_CLOUD_ORG_EXTENSION_QUOTA_MB`.
+
+For a PostgreSQL deployment behind HTTPS, configure at least:
+
+```bash
+export CLOAKBROWSER_CLOUD_DATABASE_URL='postgresql+psycopg://user:pass@db/cloak'
+export CLOAKBROWSER_CLOUD_SECRET='replace-with-at-least-32-random-bytes'
+export CLOAKBROWSER_CLOUD_COOKIE_SECURE=true
+cloakbrowser cloud --host 0.0.0.0 --no-open
+```
+
+The command prints the plaintext upstream address. Terminate TLS at a reverse
+proxy, use that proxy's HTTPS URL in the browser, and do not put database
+credentials, application secrets, or snapshot keys in command-line arguments.
+Set a proxy or select managed extensions in the environment editor. Editing
+runtime assets is blocked while the environment is running, and revision
+conflicts or incompatible Agent capabilities are reported before launch.
+
 ## Install
 
 **Python:**

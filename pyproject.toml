@@ -57,7 +57,22 @@ dependencies = [
 [project.optional-dependencies]
 geoip = ["geoip2>=4.0", "socksio>=1.0"]  # socksio: SOCKS5 transport for httpx
 serve = ["aiohttp>=3.9", "websockets>=12.0"]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.23"]
+cloud = [
+    "argon2-cffi>=23.1",
+    "fastapi>=0.115",
+    "psycopg[binary]>=3.2",
+    "sqlalchemy>=2.0",
+    "uvicorn>=0.30",
+]
+dev = [
+    "argon2-cffi>=23.1",
+    "fastapi>=0.115",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "psycopg[binary]>=3.2",
+    "sqlalchemy>=2.0",
+    "uvicorn>=0.30",
+]
 
 [project.scripts]
 cloakbrowser = "cloakbrowser.__main__:main"
