@@ -53,6 +53,23 @@ def _license_error(exc: BaseException) -> CloakBrowserLicenseError | None:
 
 # Sentinel to distinguish "viewport not provided" from "viewport=None" (disable emulation)
 _VIEWPORT_UNSET = object()
+_MACOS_NATIVE_LOCALE_MIN_VERSION = (148, 0, 7778, 215, 2)
+
+
+def _needs_macos_locale_fallback(binary_path: str | os.PathLike[str]) -> bool:
+    """Whether this binary predates the native macOS Intl locale patch."""
+    if sys.platform != "darwin":
+        return False
+    import re
+
+    match = re.search(r"chromium-(\d+(?:\.\d+){3,4})", os.fspath(binary_path), re.IGNORECASE)
+    if match is None:
+        return False
+    try:
+        version = tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return False
+    return version < _MACOS_NATIVE_LOCALE_MIN_VERSION
 
 
 def _default_no_viewport(browser: Any) -> None:
@@ -496,6 +513,11 @@ def launch_persistent_context(
     )
     if color_scheme:
         context_kwargs["color_scheme"] = color_scheme
+    # The free macOS 145 binary accepts --fingerprint-locale but still sources
+    # Intl's default locale from macOS. Use Playwright's context locale only for
+    # those old builds so navigator, Intl, and Accept-Language stay coherent.
+    if locale and _needs_macos_locale_fallback(binary_path):
+        context_kwargs["locale"] = locale
     context_kwargs.update(kwargs)
     _drop_conflicting_viewport(context_kwargs, kwargs)
 
@@ -647,6 +669,8 @@ async def launch_persistent_context_async(
     )
     if color_scheme:
         context_kwargs["color_scheme"] = color_scheme
+    if locale and _needs_macos_locale_fallback(binary_path):
+        context_kwargs["locale"] = locale
     context_kwargs.update(kwargs)
     _drop_conflicting_viewport(context_kwargs, kwargs)
 

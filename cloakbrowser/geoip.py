@@ -90,6 +90,47 @@ def resolve_proxy_geo(proxy_url: str | None) -> tuple[str | None, str | None]:
     return tz, locale
 
 
+def _geoip_database_module():
+    try:
+        import geoip2.database
+    except ImportError:
+        raise ImportError(
+            "geoip2 is required for geoip=True. Install it with:\n"
+            "  pip install 'cloakbrowser[geoip]'"
+        ) from None
+    return geoip2.database
+
+
+def _lookup_ip_geo(
+    ip: str,
+    db_path: Path | None,
+    geoip_database,
+) -> tuple[str | None, str | None]:
+    if db_path is None:
+        return None, None
+    try:
+        with geoip_database.Reader(str(db_path)) as reader:
+            resp = reader.city(ip)
+            timezone = resp.location.time_zone
+            country = resp.country.iso_code
+            locale = COUNTRY_LOCALE_MAP.get(country) if country else None
+            logger.debug(
+                "GeoIP: %s → tz=%s, country=%s, locale=%s",
+                ip, timezone, country, locale,
+            )
+            return timezone, locale
+    except Exception as exc:
+        logger.warning("GeoIP lookup failed for %s: %s", ip, exc)
+        return None, None
+
+
+def resolve_ip_geo(ip: str) -> tuple[str | None, str | None]:
+    """Resolve timezone and locale for an already verified public IP."""
+    ipaddress.ip_address(ip)
+    geoip_database = _geoip_database_module()
+    return _lookup_ip_geo(ip, _ensure_geoip_db(), geoip_database)
+
+
 def resolve_proxy_geo_with_ip(
     proxy_url: str | None,
 ) -> tuple[str | None, str | None, str | None]:
@@ -101,13 +142,7 @@ def resolve_proxy_geo_with_ip(
     When *proxy_url* is falsy, the egress IP is the machine's own public IP
     (echo services queried directly, no proxy), so geoip works proxy-free.
     """
-    try:
-        import geoip2.database  # noqa: F811
-    except ImportError:
-        raise ImportError(
-            "geoip2 is required for geoip=True. Install it with:\n"
-            "  pip install 'cloakbrowser[geoip]'"
-        ) from None
+    geoip_database = _geoip_database_module()
 
     # Ensure the DB first — the download must NOT be bounded by the resolution
     # timeout (a first-use ~70MB fetch legitimately outlasts it).
@@ -131,23 +166,8 @@ def resolve_proxy_geo_with_ip(
         return None, None, None
 
     # DB only drives tz/locale; a missing/failed DB still returns the exit IP.
-    if db_path is None:
-        return None, None, ip
-
-    try:
-        with geoip2.database.Reader(str(db_path)) as reader:
-            resp = reader.city(ip)
-            timezone = resp.location.time_zone
-            country = resp.country.iso_code
-            locale = COUNTRY_LOCALE_MAP.get(country) if country else None
-            logger.debug(
-                "GeoIP: %s → tz=%s, country=%s, locale=%s",
-                ip, timezone, country, locale,
-            )
-            return timezone, locale, ip
-    except Exception as exc:
-        logger.warning("GeoIP lookup failed for %s: %s", ip, exc)
-        return None, None, ip
+    timezone, locale = _lookup_ip_geo(ip, db_path, geoip_database)
+    return timezone, locale, ip
 
 
 # ---------------------------------------------------------------------------

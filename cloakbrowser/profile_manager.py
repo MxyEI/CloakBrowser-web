@@ -35,6 +35,7 @@ _PROFILE_ID_RE = re.compile(r"^env_[a-f0-9]{12}$")
 _TIMEZONE_RE = re.compile(r"^[A-Za-z0-9_+./-]{0,80}$")
 _LOCALE_RE = re.compile(r"^[A-Za-z0-9-]{0,35}$")
 _VERSION_RE = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,7}){0,3}$")
+_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 PROFILE_EXPORT_FORMAT = "cloakbrowser-profile-export"
 PROFILE_EXPORT_VERSION = 1
 _LOCATION_PRESETS: dict[str, dict[str, float]] = {
@@ -231,11 +232,23 @@ def _validate_proxy(value: Any) -> str:
         _ = parsed.port
     except ValueError as exc:
         raise ProfileError("proxy is not a valid URL") from exc
-    if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"}:
+    if parsed.scheme.lower() not in _PROXY_SCHEMES:
         raise ProfileError("proxy scheme must be http, https, socks5, or socks5h")
     if not parsed.hostname:
         raise ProfileError("proxy host is required")
     return proxy
+
+
+def _validate_proxy_scheme(value: Any) -> str:
+    scheme = _clean_text(value, "proxy_scheme", 10, required=True).lower()
+    if scheme not in _PROXY_SCHEMES:
+        raise ProfileError("proxy scheme must be http, https, socks5, or socks5h")
+    return scheme
+
+
+def _replace_proxy_scheme(proxy: str, scheme: str) -> str:
+    candidate = proxy if "://" in proxy else f"http://{proxy}"
+    return urlsplit(candidate)._replace(scheme=scheme).geturl()
 
 
 def _validate_startup_url(value: Any) -> str:
@@ -333,10 +346,13 @@ def _apply_browser_locale_preferences(browser_data_dir: Path, locale: str) -> No
         intl = {}
     if locale:
         language = locale.split("-", 1)[0]
-        intl["accept_languages"] = locale if language == locale else f"{locale},{language}"
+        languages = locale if language == locale else f"{locale},{language}"
+        intl["accept_languages"] = languages
+        intl["selected_languages"] = languages
         preferences["intl"] = intl
     else:
         intl.pop("accept_languages", None)
+        intl.pop("selected_languages", None)
         if intl:
             preferences["intl"] = intl
         else:
@@ -492,12 +508,19 @@ class ProfileStore:
         if not 1 <= seed <= 2_147_483_647:
             raise ProfileError("fingerprint_seed must be between 1 and 2147483647")
 
+        proxy_scheme = (
+            _validate_proxy_scheme(payload["proxy_scheme"])
+            if "proxy_scheme" in payload
+            else None
+        )
         if payload.get("clear_proxy") is True:
             proxy = ""
         elif "proxy" in payload and payload["proxy"] not in (None, ""):
             proxy = _validate_proxy(payload["proxy"])
         else:
             proxy = old.get("proxy", "")
+            if proxy and proxy_scheme:
+                proxy = _replace_proxy_scheme(proxy, proxy_scheme)
 
         timezone_value = _clean_text(payload.get("timezone", old.get("timezone", "")), "timezone", 80)
         location = _clean_text(payload.get("location", old.get("location", "")), "location", 40)
@@ -1040,12 +1063,14 @@ class ManagerApplication:
         store: ProfileStore | None = None,
         proxy_resolver: Callable[[str | None], str | None] | None = None,
         preview_launcher: Callable[..., Any] | None = None,
+        proxy_geo_resolver: Callable[[str], tuple[str | None, str | None]] | None = None,
     ) -> None:
         self.store = store or ProfileStore()
         self.sessions = BrowserSessionManager(self.store, proxy_resolver=proxy_resolver)
         self.csrf_token = secrets.token_urlsafe(32)
         self.assets_dir = Path(__file__).with_name("manager_ui")
         self._proxy_resolver = proxy_resolver
+        self._proxy_geo_resolver = proxy_geo_resolver
         self._preview_launcher = preview_launcher
         self._preview_lock = threading.Lock()
 
@@ -1187,10 +1212,17 @@ class ManagerApplication:
             profile = self.store.get(profile_id)
 
         provided_proxy = payload.get("proxy")
+        proxy_scheme = (
+            _validate_proxy_scheme(payload["proxy_scheme"])
+            if "proxy_scheme" in payload
+            else None
+        )
         if provided_proxy not in (None, ""):
             proxy = _validate_proxy(provided_proxy)
         else:
             proxy = profile.get("proxy", "") if profile else ""
+            if proxy and proxy_scheme:
+                proxy = _replace_proxy_scheme(proxy, proxy_scheme)
         if not proxy:
             raise ProfileError("proxy is required")
 
@@ -1207,6 +1239,20 @@ class ManagerApplication:
             raise ProxyCheckError(f"proxy check failed: {message}") from exc
         if not exit_ip:
             raise ProxyCheckError("could not resolve a public exit IP through this proxy")
+        exit_ip = str(exit_ip).strip()
+
+        timezone_name = None
+        locale = None
+        geo_resolver = self._proxy_geo_resolver
+        if geo_resolver is None and self._proxy_resolver is None:
+            from .geoip import resolve_ip_geo
+
+            geo_resolver = resolve_ip_geo
+        if geo_resolver is not None:
+            try:
+                timezone_name, locale = geo_resolver(exit_ip)
+            except (ImportError, OSError, ValueError):
+                pass
 
         previous_ip = profile.get("proxy_exit_ip", "") if profile else ""
         checked_at = _utc_now()
@@ -1217,6 +1263,10 @@ class ManagerApplication:
         locked_ip = profile.get("locked_proxy_ip", "") if uses_saved_proxy and profile else ""
         return {
             "exit_ip": exit_ip,
+            "timezone": timezone_name,
+            "locale": locale,
+            "webrtc_ip": exit_ip,
+            "geoip_ready": bool(timezone_name and locale),
             "checked_at": checked_at,
             "changed": bool(previous_ip and previous_ip != exit_ip),
             "previous_ip": previous_ip,
@@ -1356,6 +1406,14 @@ class _ManagerRequestHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+        route = self._profile_route()
+        if route is not None and route[1] == "proxy":
+            try:
+                profile = self.app.store.get(route[0])
+                self._json(HTTPStatus.OK, {"proxy": profile.get("proxy", "")})
+            except ProfileNotFound as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc))
             return
 
         assets = {

@@ -92,6 +92,7 @@ def test_browser_locale_preferences_merge_and_clear(tmp_path):
     assert preferences["intl"] == {
         "charset_default": "UTF-8",
         "accept_languages": "en-US,en",
+        "selected_languages": "en-US,en",
     }
 
     store.apply_browser_locale(profile["id"], "")
@@ -110,6 +111,21 @@ def test_update_keeps_proxy_when_field_is_blank_and_can_clear_it(tmp_path):
     cleared = store.update(profile["id"], {"clear_proxy": True})
     assert cleared["proxy"] == ""
     assert cleared["geoip"] is False
+
+
+def test_update_can_change_only_saved_proxy_scheme(tmp_path):
+    store = ProfileStore(tmp_path)
+    profile = store.create(_profile_payload())
+    store.mark_proxy_checked(profile["id"], "1.2.3.4")
+
+    updated = store.update(
+        profile["id"],
+        {"proxy": "", "proxy_scheme": "socks5"},
+    )
+
+    assert updated["proxy"] == "socks5://proxy-user:proxy-password@proxy.example:8080"
+    assert updated["proxy_exit_ip"] == ""
+    assert updated["proxy_checked_at"] is None
 
 
 def test_geoip_is_disabled_without_proxy(tmp_path):
@@ -217,6 +233,7 @@ def test_delete_moves_environment_to_trash(tmp_path):
     [
         {"name": ""},
         {"proxy": "ftp://proxy.example:21"},
+        {"proxy_scheme": "ftp"},
         {"proxy": "http://proxy.example:bad"},
         {"startup_url": "file:///etc/passwd"},
         {"timezone": "Asia/Shanghai\n--bad"},
@@ -457,6 +474,7 @@ def test_session_supports_manual_timezone_and_location_without_proxy(tmp_path):
     preferences_path = store.browser_data_dir(profile["id"]) / "Default" / "Preferences"
     preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
     assert preferences["intl"]["accept_languages"] == "en-US,en"
+    assert preferences["intl"]["selected_languages"] == "en-US,en"
     manager.stop_all()
 
 
@@ -563,6 +581,10 @@ def test_proxy_check_persists_exit_ip_and_detects_change(tmp_path):
     assert first["changed"] is False
     assert second == {
         "exit_ip": "5.6.7.8",
+        "timezone": None,
+        "locale": None,
+        "webrtc_ip": "5.6.7.8",
+        "geoip_ready": False,
         "checked_at": store.get(profile["id"])["proxy_checked_at"],
         "changed": True,
         "previous_ip": "1.2.3.4",
@@ -728,6 +750,39 @@ def test_proxy_check_preserves_socks5_scheme(tmp_path):
     assert seen == ["socks5://user:pass@proxy.example:1080"]
 
 
+def test_proxy_check_uses_unsaved_scheme_with_saved_credentials(tmp_path):
+    store = ProfileStore(tmp_path)
+    profile = store.create(_profile_payload(proxy="socks5://user:pass@proxy.example:1080"))
+    seen = []
+    app = ManagerApplication(store, proxy_resolver=lambda proxy: seen.append(proxy) or "4.3.2.1")
+
+    result = app.check_proxy(
+        {"profile_id": profile["id"], "proxy": "", "proxy_scheme": "http"}
+    )
+
+    assert result["exit_ip"] == "4.3.2.1"
+    assert seen == ["http://user:pass@proxy.example:1080"]
+    assert store.get(profile["id"])["proxy"].startswith("socks5://")
+
+
+def test_proxy_check_returns_geoip_fingerprint_settings(tmp_path):
+    store = ProfileStore(tmp_path)
+    app = ManagerApplication(
+        store,
+        proxy_resolver=lambda _proxy: "4.3.2.1",
+        proxy_geo_resolver=lambda ip: (
+            ("Europe/Berlin", "de-DE") if ip == "4.3.2.1" else (None, None)
+        ),
+    )
+
+    result = app.check_proxy({"proxy": "socks5://user:pass@proxy.example:1080"})
+
+    assert result["timezone"] == "Europe/Berlin"
+    assert result["locale"] == "de-DE"
+    assert result["webrtc_ip"] == "4.3.2.1"
+    assert result["geoip_ready"] is True
+
+
 def test_proxy_check_failure_redacts_credentials(tmp_path):
     store = ProfileStore(tmp_path)
 
@@ -816,6 +871,7 @@ def test_fingerprint_preview_uses_temporary_seeded_browser(tmp_path):
     assert kwargs["locale"] == "en-US"
     assert kwargs["geolocation"]["latitude"] == 40.7128
     assert preferences["intl"]["accept_languages"] == "en-US,en"
+    assert preferences["intl"]["selected_languages"] == "en-US,en"
     assert context.closed.is_set()
     assert not preview_dir.exists()
 
@@ -840,6 +896,16 @@ def test_manager_http_api_masks_proxy_and_requires_csrf(tmp_path):
         assert response.status == 200
         assert "proxy-password" not in body
         assert "proxy-user:****@proxy.example:8080" in body
+
+        connection.request(
+            "GET",
+            f"/api/profiles/{profile['id']}/proxy",
+            headers={"Host": f"127.0.0.1:{port}"},
+        )
+        response = connection.getresponse()
+        editable_proxy = json.loads(response.read())
+        assert response.status == 200
+        assert editable_proxy["proxy"] == profile["proxy"]
 
         connection.request(
             "POST",
@@ -941,6 +1007,7 @@ def test_manager_ui_exposes_profile_management_controls():
     ui_dir = Path(__file__).parents[1] / "cloakbrowser" / "manager_ui"
     html = (ui_dir / "index.html").read_text(encoding="utf-8")
     javascript = (ui_dir / "app.js").read_text(encoding="utf-8")
+    stylesheet = (ui_dir / "app.css").read_text(encoding="utf-8")
 
     assert 'id="lockProxyIpInput"' in html
     assert 'id="acceptProxyIpButton"' in html
@@ -960,6 +1027,18 @@ def test_manager_ui_exposes_profile_management_controls():
     assert 'id="geoipInput" name="geoip" type="checkbox">' in html
     assert "syncGeoipAvailability" in javascript
     assert 'option value="socks5"' in html
+    assert 'id="proxyInput" name="proxy" type="text"' in html
+    assert 'id="toggleProxyButton"' not in html
+    assert "/api/profiles/${profileId}/proxy" in javascript
+    assert "elements.geoip.checked = true" in javascript
+    assert 'setTimezoneValue("")' in javascript
+    assert 'elements.location.value = ""' in javascript
+    assert 'setLocaleValue("")' in javascript
+    assert "result.webrtc_ip" in javascript
+    assert "proxy_scheme: elements.proxyScheme.value" in javascript
+    assert 'elements.proxyScheme.addEventListener("change"' in javascript
+    assert '.classList.toggle("error"' in javascript
+    assert ".proxy-change.error" in stylesheet
     assert 'option value="America/New_York"' in html
     assert 'id="locationInput"' in html
     assert 'option value="new-york"' in html

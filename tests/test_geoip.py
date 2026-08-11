@@ -12,6 +12,7 @@ from cloakbrowser.geoip import (
     _is_private_ip,
     _resolve_exit_ip,
     _resolve_proxy_ip,
+    resolve_ip_geo,
 )
 
 
@@ -65,6 +66,21 @@ def test_locale_map_values_are_bcp47():
         assert len(parts) == 2, f"{code}: {locale} not language-REGION"
         assert parts[0].islower(), f"{code}: language part should be lowercase"
         assert parts[1].isupper(), f"{code}: region part should be uppercase"
+
+
+def test_resolve_ip_geo_uses_existing_exit_ip():
+    database = MagicMock()
+    reader = database.Reader.return_value.__enter__.return_value
+    response = reader.city.return_value
+    response.location.time_zone = "Europe/Berlin"
+    response.country.iso_code = "DE"
+
+    with patch("cloakbrowser.geoip._geoip_database_module", return_value=database), patch(
+        "cloakbrowser.geoip._ensure_geoip_db", return_value="/tmp/GeoLite2-City.mmdb"
+    ):
+        assert resolve_ip_geo("4.3.2.1") == ("Europe/Berlin", "de-DE")
+
+    reader.city.assert_called_once_with("4.3.2.1")
 
 
 # ---------------------------------------------------------------------------

@@ -406,6 +406,30 @@ function proxyValue() {
   return `${elements.proxyScheme.value}://${value}`;
 }
 
+async function loadEditableProxy(profileId) {
+  try {
+    const result = await api(`/api/profiles/${profileId}/proxy`);
+    if (state.editingId !== profileId) return;
+    const proxy = result.proxy || "";
+    const separator = proxy.indexOf("://");
+    if (separator >= 0) {
+      elements.proxyScheme.value = proxy.slice(0, separator).toLowerCase();
+      elements.proxyInput.value = proxy.slice(separator + 3);
+    } else {
+      elements.proxyInput.value = proxy;
+    }
+    elements.currentProxy.textContent = "";
+    syncGeoipAvailability();
+  } catch (error) {
+    if (state.editingId === profileId) showToast(error.message, "error");
+  } finally {
+    if (state.editingId === profileId) {
+      elements.proxyInput.disabled = false;
+      elements.proxyScheme.disabled = false;
+    }
+  }
+}
+
 function setTimezoneValue(value) {
   elements.timezone.querySelector("option[data-custom-timezone]")?.remove();
   if (value && ![...elements.timezone.options].some((option) => option.value === value)) {
@@ -729,8 +753,8 @@ function openProfileModal(profile = null) {
   elements.startupUrl.value = profile?.startup_url === "about:blank" ? "" : (profile?.startup_url || "");
   elements.proxyInput.value = "";
   elements.proxyScheme.value = profile?.proxy_masked?.split("://", 1)[0] || "http";
-  elements.proxyInput.type = "password";
-  document.querySelector("#toggleProxyButton").textContent = "显示";
+  elements.proxyInput.disabled = Boolean(profile?.proxy_configured);
+  elements.proxyScheme.disabled = Boolean(profile?.proxy_configured);
   elements.currentProxy.textContent = profile?.proxy_masked || "";
   elements.proxyResult.hidden = !profile?.proxy_exit_ip;
   elements.proxyResultIp.textContent = profile?.proxy_exit_ip || "";
@@ -761,6 +785,7 @@ function openProfileModal(profile = null) {
   elements.humanize.checked = profile?.humanize ?? false;
   elements.quota.value = profile?.storage_quota_mb || 5000;
   elements.notes.value = profile?.notes || "";
+  if (profile?.proxy_configured) void loadEditableProxy(profile.id);
   state.previewGeneration += 1;
   state.previewQueued = false;
   const captured = profile?.fingerprint_details && Object.keys(profile.fingerprint_details).length
@@ -796,6 +821,7 @@ function formPayload() {
     tags: elements.tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
     fingerprint_seed: Number(elements.seed.value),
     proxy: proxyValue(),
+    proxy_scheme: elements.proxyScheme.value,
     clear_proxy: elements.clearProxy.checked,
     lock_proxy_ip: elements.lockProxyIp.checked,
     geoip: elements.geoip.checked,
@@ -822,7 +848,10 @@ async function saveProfile(event) {
       body: JSON.stringify(payload),
     });
     const savedId = response.profile.id;
-    if (state.proxyCheck && state.proxyCheck.proxy === payload.proxy && response.profile.proxy_configured) {
+    if (state.proxyCheck
+        && state.proxyCheck.proxy === payload.proxy
+        && state.proxyCheck.proxyScheme === payload.proxy_scheme
+        && response.profile.proxy_configured) {
       try {
         await api("/api/proxy/check", {
           method: "POST",
@@ -844,6 +873,7 @@ async function saveProfile(event) {
 
 async function checkProxy() {
   const proxy = proxyValue();
+  const proxyScheme = elements.proxyScheme.value;
   elements.checkProxyButton.disabled = true;
   elements.checkProxyButton.textContent = "检测中";
   try {
@@ -852,16 +882,33 @@ async function checkProxy() {
       body: JSON.stringify({
         profile_id: state.editingId,
         proxy,
+        proxy_scheme: proxyScheme,
       }),
     });
-    state.proxyCheck = { proxy, result };
+    state.proxyCheck = { proxy, proxyScheme, result };
     elements.proxyResult.hidden = false;
     elements.proxyResultIp.textContent = result.exit_ip;
-    elements.proxyChange.textContent = result.lock_conflict
-      ? `与锁定 IP ${result.locked_ip} 不一致`
-      : result.changed ? `原出口 ${result.previous_ip}` : "";
+    const proxyDetails = [];
+    if (result.lock_conflict) proxyDetails.push(`与锁定 IP ${result.locked_ip} 不一致`);
+    else if (result.changed) proxyDetails.push(`原出口 ${result.previous_ip}`);
+    if (result.timezone) proxyDetails.push(result.timezone);
+    if (result.locale) proxyDetails.push(result.locale);
+    if (result.webrtc_ip) proxyDetails.push(`WebRTC ${result.webrtc_ip}`);
+    elements.proxyChange.textContent = proxyDetails.join(" · ");
+    elements.proxyChange.classList.toggle("error", Boolean(result.lock_conflict || result.changed));
+    if (result.geoip_ready) {
+      setTimezoneValue("");
+      elements.location.value = "";
+      setLocaleValue("");
+      elements.geoip.checked = true;
+      updateConsistencyWarnings();
+      scheduleFingerprintPreview(250);
+    }
     renderProxyLockState(profileById(state.editingId), result);
-    showToast(result.lock_conflict ? "代理出口 IP 与锁定值不一致" : result.changed ? "代理出口 IP 已变化" : "代理连接正常", result.lock_conflict || result.changed ? "error" : "success");
+    const successMessage = result.geoip_ready
+      ? `已自动匹配 ${result.timezone}、${result.locale} 和 WebRTC IP`
+      : "代理连接正常，未能自动匹配时区和语言";
+    showToast(result.lock_conflict ? "代理出口 IP 与锁定值不一致" : result.changed ? "代理出口 IP 已变化" : successMessage, result.lock_conflict || result.changed ? "error" : "success");
     if (state.editingId && !proxy) {
       await loadProfiles({ quiet: true });
       renderProxyLockState(profileById(state.editingId), result);
@@ -1173,11 +1220,6 @@ elements.geoip.addEventListener("change", () => updateConsistencyWarnings());
   updateAdvancedFingerprintState();
   scheduleFingerprintPreview();
 }));
-document.querySelector("#toggleProxyButton").addEventListener("click", (event) => {
-  const show = elements.proxyInput.type === "password";
-  elements.proxyInput.type = show ? "text" : "password";
-  event.currentTarget.textContent = show ? "隐藏" : "显示";
-});
 elements.checkProxyButton.addEventListener("click", checkProxy);
 elements.acceptProxyIpButton.addEventListener("click", () => acceptProxyIp(state.editingId));
 elements.lockProxyIp.addEventListener("change", () => renderProxyLockState(profileById(state.editingId), state.proxyCheck?.result));
@@ -1209,6 +1251,11 @@ elements.proxyInput.addEventListener("input", () => {
   elements.proxyChange.textContent = "";
   syncGeoipAvailability();
   updateConsistencyWarnings();
+});
+elements.proxyScheme.addEventListener("change", () => {
+  state.proxyCheck = null;
+  elements.proxyResult.hidden = true;
+  elements.proxyChange.textContent = "";
 });
 elements.clearProxy.addEventListener("change", () => {
   if (elements.clearProxy.checked) {

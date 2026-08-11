@@ -1004,7 +1004,7 @@ tbody tr.selected {
 }
 
 .proxy-action {
-  grid-template-columns: 82px minmax(0, 1fr) 50px 72px;
+  grid-template-columns: 82px minmax(0, 1fr) 72px;
 }
 
 .proxy-action select {
@@ -1028,16 +1028,13 @@ tbody tr.selected {
   font-weight: 600;
 }
 
-.proxy-action button:nth-child(3) {
-  border-radius: 0;
-}
-
 .proxy-result {
   min-height: 36px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 0 11px;
+  padding: 8px 11px;
   border: 1px solid #b9d8cc;
   border-radius: 5px;
   background: #f2fbf7;
@@ -1052,8 +1049,15 @@ tbody tr.selected {
 
 .proxy-change {
   margin-left: auto;
-  color: var(--danger);
+  min-width: 0;
+  color: #356454;
   font-weight: 600;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.proxy-change.error {
+  color: var(--danger);
 }
 
 .proxy-lock-control {

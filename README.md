@@ -111,13 +111,16 @@ The command opens `http://127.0.0.1:8765`. You can create, edit, clone, launch,
 stop, search, batch start/stop, test proxy connectivity, and delete environments
 from the interface. Environments can be organized with groups and tags, filtered,
 selected, and started or stopped as a chosen batch. A successful proxy test
-saves the latest observed exit IP on
-the environment so unexpected IP changes are visible. Environments can also lock
+saves the latest observed exit IP, displays the matched timezone, locale, and
+WebRTC IP, and enables automatic GeoIP matching on the environment so unexpected
+IP changes are visible. Environments can also lock
 that exit IP: every launch verifies the proxy before opening Chromium, blocks an
 unexpected IP, and lets you explicitly accept the latest observed IP. Deleted environments are
 moved to `~/.cloakbrowser/manager/_trash` instead of being permanently removed.
-Proxy credentials are stored in local profile files with restricted permissions
-and are masked in the management API.
+Proxy credentials are stored in local profile files with restricted permissions.
+List and summary APIs mask them; the local editor reloads the complete URL from a
+dedicated no-store endpoint so the plain-text proxy field and protocol selector
+can edit an existing proxy without re-entering its credentials.
 
 Selected environments can be exported as JSON and imported into another manager
 data directory. Safe export is the default and removes proxy URLs; choose the

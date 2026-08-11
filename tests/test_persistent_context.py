@@ -118,6 +118,25 @@ def test_persistent_context_locale_and_timezone(_mock_bin):
     assert "locale" not in call_kwargs
 
 
+@patch(
+    "cloakbrowser.browser.ensure_binary",
+    return_value="/tmp/chromium-145.0.7632.109.2/Chromium",
+)
+def test_old_macos_persistent_context_uses_locale_fallback(_mock_bin):
+    pw_cm, pw, context = _make_mock_pw_and_context()
+
+    with patch("cloakbrowser.browser.sys.platform", "darwin"), patch(
+        "playwright.sync_api.sync_playwright", return_value=pw_cm
+    ):
+        from cloakbrowser.browser import launch_persistent_context
+
+        launch_persistent_context("/tmp/profile", locale="en-US")
+
+    call_kwargs = pw.chromium.launch_persistent_context.call_args[1]
+    assert "--fingerprint-locale=en-US" in call_kwargs["args"]
+    assert call_kwargs["locale"] == "en-US"
+
+
 @patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
 @patch("cloakbrowser.browser.maybe_resolve_geoip", return_value=(None, None, None))
 def test_persistent_context_color_scheme(_mock_geoip, _mock_bin):
