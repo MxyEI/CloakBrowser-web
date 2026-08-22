@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import stat
 from threading import Barrier
 import uuid
@@ -22,6 +23,8 @@ from sqlalchemy import select
 
 from cloakbrowser.cloud.app import create_app
 from cloakbrowser.cloud import agent_cli
+from cloakbrowser.cloud import workspace_app
+from cloakbrowser.cloud import workspace_cli
 from cloakbrowser.cloud.agent_runtime import AgentRuntime
 from cloakbrowser.cloud.cli import add_cloud_parser
 from cloakbrowser.cloud.models import EnvironmentSecret, RemoteTask, utc_now
@@ -65,6 +68,18 @@ def register(client, email="owner@example.com", name="Owner", team="Acme"):
         },
     )
     assert response.status_code == 201, response.text
+    return response.json()
+
+
+def login(client, email="owner@example.com"):
+    response = client.post(
+        "/api/auth/login",
+        json={
+            "email": email,
+            "password": "correct-horse-battery-staple",
+        },
+    )
+    assert response.status_code == 200, response.text
     return response.json()
 
 
@@ -300,6 +315,1031 @@ def test_team_roles_and_tenant_isolation(cloud_app):
         assert promoted.status_code == 200
 
 
+def test_platform_superadmin_can_manage_organizations_without_membership(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'superadmin.db'}"
+    bootstrap_settings = CloudSettings(
+        database_url=database_url,
+        secret_key="superadmin-test-secret-with-at-least-thirty-two-bytes",
+        cookie_secure=False,
+        assets_dir=Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "ui",
+    )
+    bootstrap_app = create_app(bootstrap_settings)
+    try:
+        with (
+            TestClient(bootstrap_app) as root_client,
+            TestClient(bootstrap_app) as owner_client,
+            TestClient(bootstrap_app) as member_client,
+        ):
+            register(
+                root_client,
+                "root@example.com",
+                "Platform Root",
+                "Platform Administration",
+            )
+            owner_auth = register(
+                owner_client,
+                "owner@example.com",
+                "Owner",
+                "Owner Team",
+            )
+            register(member_client, "member@example.com", "Member", "Personal")
+            owner_team_id = owner_auth["organization"]["id"]
+    finally:
+        bootstrap_app.state.engine.dispose()
+
+    settings = CloudSettings(
+        database_url=database_url,
+        secret_key="superadmin-test-secret-with-at-least-thirty-two-bytes",
+        cookie_secure=False,
+        assets_dir=Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "ui",
+        superadmin_emails=frozenset(
+            {"root@example.com", "reserved-root@example.com"}
+        ),
+    )
+    app = create_app(settings)
+    try:
+        with TestClient(app) as root_client, TestClient(app) as member_client:
+            reserved = root_client.post(
+                "/api/auth/register",
+                json={
+                    "email": "reserved-root@example.com",
+                    "password": "correct-horse-battery-staple",
+                    "display_name": "Reserved Root",
+                    "organization_name": "Claimed Platform",
+                },
+            )
+            assert reserved.status_code == 403
+            assert "created before enabling" in reserved.json()["detail"]
+            root_auth = login(root_client, "root@example.com")
+            login(member_client, "member@example.com")
+            member_session = current_session(member_client)
+            blocked = member_client.post(
+                "/api/session/organization",
+                headers={"X-CSRF-Token": member_session["csrf_token"]},
+                json={"organization_id": owner_team_id},
+            )
+            assert blocked.status_code == 404
+
+            root_session = current_session(root_client)
+            assert root_session["is_superadmin"] is True
+            assert {item["name"] for item in root_session["organizations"]} == {
+                "Platform Administration",
+                "Owner Team",
+                "Personal",
+            }
+            assert all(
+                item["role"] == "owner" and item["platform_access"] is True
+                for item in root_session["organizations"]
+            )
+            switched = root_client.post(
+                "/api/session/organization",
+                headers={"X-CSRF-Token": root_session["csrf_token"]},
+                json={"organization_id": owner_team_id},
+            )
+            assert switched.status_code == 200, switched.text
+            assert switched.json()["organization"]["platform_access"] is True
+
+            members = root_client.get("/api/members").json()["members"]
+            assert {item["user"]["email"] for item in members} == {
+                "owner@example.com"
+            }
+            member_added = root_client.post(
+                "/api/members",
+                headers=csrf_headers(root_auth),
+                json={"email": "member@example.com", "role": "member"},
+            )
+            assert member_added.status_code == 201, member_added.text
+            membership = member_added.json()["member"]
+
+            assigned = root_client.post(
+                "/api/environments",
+                headers=csrf_headers(root_auth),
+                json={
+                    "name": "Assigned by Platform",
+                    "storage_policy": "shared",
+                    "assigned_membership_ids": [membership["id"]],
+                    "config": {"fingerprint_seed": 24680},
+                },
+            )
+            assert assigned.status_code == 201, assigned.text
+            private = root_client.post(
+                "/api/environments",
+                headers=csrf_headers(root_auth),
+                json={
+                    "name": "Owner Only",
+                    "storage_policy": "shared",
+                    "config": {"fingerprint_seed": 13579},
+                },
+            )
+            assert private.status_code == 201, private.text
+
+            member_session = current_session(member_client)
+            switched = member_client.post(
+                "/api/session/organization",
+                headers={"X-CSRF-Token": member_session["csrf_token"]},
+                json={"organization_id": owner_team_id},
+            )
+            assert switched.status_code == 200, switched.text
+            visible = member_client.get("/api/environments").json()["environments"]
+            assert [item["id"] for item in visible] == [
+                assigned.json()["environment"]["id"]
+            ]
+
+            audit = root_client.get("/api/audit").json()["entries"]
+            accessed = next(
+                item
+                for item in audit
+                if item["action"] == "platform.organization_accessed"
+            )
+            assert accessed["details"]["platform_superadmin"] is True
+            platform_mutations = [
+                item
+                for item in audit
+                if item["action"] in {"member.added", "environment.created"}
+            ]
+            assert len(platform_mutations) == 3
+            assert all(
+                item["details"]["platform_superadmin"] is True
+                for item in platform_mutations
+            )
+    finally:
+        app.state.engine.dispose()
+
+
+def test_platform_superadmin_manages_user_lifecycle_and_revokes_credentials(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'platform-users.db'}"
+    bootstrap_settings = CloudSettings(
+        database_url=database_url,
+        secret_key="platform-users-test-secret-with-at-least-thirty-two-bytes",
+        cookie_secure=False,
+        assets_dir=Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "ui",
+    )
+    bootstrap_app = create_app(bootstrap_settings)
+    try:
+        with TestClient(bootstrap_app) as root_client, TestClient(
+            bootstrap_app
+        ) as owner_client:
+            register(root_client, "root@example.com", "Platform Root", "Platform Team")
+            register(owner_client, "owner@example.com", "Owner", "Owner Team")
+    finally:
+        bootstrap_app.state.engine.dispose()
+
+    settings = CloudSettings(
+        database_url=database_url,
+        secret_key="platform-users-test-secret-with-at-least-thirty-two-bytes",
+        cookie_secure=False,
+        assets_dir=Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "ui",
+        superadmin_emails=frozenset(
+            {"root@example.com", "reserved-root@example.com"}
+        ),
+    )
+    app = create_app(settings)
+    try:
+        with (
+            TestClient(app) as root_client,
+            TestClient(app) as owner_client,
+            TestClient(app) as user_client,
+        ):
+            root_auth = login(root_client, "root@example.com")
+            owner_auth = login(owner_client, "owner@example.com")
+            assert owner_client.get("/api/platform/users").status_code == 403
+            assert owner_client.post(
+                "/api/platform/users",
+                headers=csrf_headers(owner_auth),
+                json={
+                    "email": "blocked@example.com",
+                    "display_name": "Blocked",
+                    "password": "blocked-password-123",
+                },
+            ).status_code == 403
+
+            created_response = root_client.post(
+                "/api/platform/users",
+                headers=csrf_headers(root_auth),
+                json={
+                    "email": "managed@example.com",
+                    "display_name": "Managed User",
+                    "password": "initial-password-123",
+                },
+            )
+            assert created_response.status_code == 201, created_response.text
+            managed_user = created_response.json()["user"]
+            assert managed_user["memberships"] == []
+            assert managed_user["device_count"] == 0
+            assert root_client.post(
+                "/api/platform/users",
+                headers=csrf_headers(root_auth),
+                json={
+                    "email": "MANAGED@example.com",
+                    "display_name": "Duplicate",
+                    "password": "duplicate-password-123",
+                },
+            ).status_code == 409
+
+            unassigned_login = user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "managed@example.com",
+                    "password": "initial-password-123",
+                },
+            )
+            assert unassigned_login.status_code == 403
+            added = root_client.post(
+                "/api/members",
+                headers=csrf_headers(root_auth),
+                json={"email": "managed@example.com", "role": "member"},
+            )
+            assert added.status_code == 201, added.text
+            membership = added.json()["member"]
+            environment = root_client.post(
+                "/api/environments",
+                headers=csrf_headers(root_auth),
+                json={
+                    "name": "Managed Account",
+                    "storage_policy": "shared",
+                    "assigned_membership_ids": [membership["id"]],
+                    "config": {"fingerprint_seed": 86420},
+                },
+            ).json()["environment"]
+
+            user_login = user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "managed@example.com",
+                    "password": "initial-password-123",
+                },
+            )
+            assert user_login.status_code == 200, user_login.text
+            device_uid = str(uuid.uuid4())
+            device_payload = {
+                "email": "managed@example.com",
+                "password": "initial-password-123",
+                "device_uid": device_uid,
+                "device_name": "Managed Desktop",
+                "capabilities": {
+                    "browser_launch": True,
+                    "snapshot_sync": True,
+                    "secret_sync": True,
+                    "extension_sync": True,
+                },
+            }
+            device_login = user_client.post("/api/client/login", json=device_payload)
+            assert device_login.status_code == 200, device_login.text
+            old_device_token = device_login.json()["device_token"]
+            acquired = user_client.post(
+                "/api/agent/leases/acquire",
+                headers=agent_headers(old_device_token),
+                json={"environment_id": environment["id"]},
+            )
+            assert acquired.status_code == 201, acquired.text
+            lease = acquired.json()
+
+            reset_conflict = root_client.patch(
+                f"/api/platform/users/{managed_user['id']}/password",
+                headers=csrf_headers(root_auth),
+                json={"password": "replacement-password-123"},
+            )
+            assert reset_conflict.status_code == 409
+            deactivate_conflict = root_client.patch(
+                f"/api/platform/users/{managed_user['id']}/status",
+                headers=csrf_headers(root_auth),
+                json={"is_active": False},
+            )
+            assert deactivate_conflict.status_code == 409
+            proof = {
+                "lease_id": lease["lease"]["lease_id"],
+                "lease_token": lease["lease_token"],
+                "fencing_token": lease["lease"]["fencing_token"],
+            }
+            assert user_client.post(
+                f"/api/agent/leases/{environment['id']}/release",
+                headers=agent_headers(old_device_token),
+                json=proof,
+            ).status_code == 204
+
+            reset = root_client.patch(
+                f"/api/platform/users/{managed_user['id']}/password",
+                headers=csrf_headers(root_auth),
+                json={"password": "replacement-password-123"},
+            )
+            assert reset.status_code == 200, reset.text
+            assert reset.json()["sessions_revoked"] == 1
+            assert reset.json()["devices_revoked"] == 1
+            assert user_client.get("/api/session").status_code == 401
+            assert user_client.get(
+                "/api/agent/environments",
+                headers=agent_headers(old_device_token),
+            ).status_code == 401
+            assert user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "managed@example.com",
+                    "password": "initial-password-123",
+                },
+            ).status_code == 401
+
+            replacement_login = user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "managed@example.com",
+                    "password": "replacement-password-123",
+                },
+            )
+            assert replacement_login.status_code == 200, replacement_login.text
+            replacement_device = user_client.post(
+                "/api/client/login",
+                json={**device_payload, "password": "replacement-password-123"},
+            )
+            assert replacement_device.status_code == 200, replacement_device.text
+            replacement_token = replacement_device.json()["device_token"]
+            assert replacement_token != old_device_token
+
+            platform_users = root_client.get("/api/platform/users").json()["users"]
+            listed = next(item for item in platform_users if item["id"] == managed_user["id"])
+            assert listed["membership_count"] == 1
+            assert listed["memberships"][0]["role"] == "member"
+            assert listed["device_count"] == 1
+            assert listed["active_device_count"] == 1
+
+            deactivated = root_client.patch(
+                f"/api/platform/users/{managed_user['id']}/status",
+                headers=csrf_headers(root_auth),
+                json={"is_active": False},
+            )
+            assert deactivated.status_code == 200, deactivated.text
+            assert deactivated.json()["sessions_revoked"] == 1
+            assert deactivated.json()["devices_revoked"] == 1
+            assert user_client.get("/api/session").status_code == 401
+            assert user_client.get(
+                "/api/agent/environments",
+                headers=agent_headers(replacement_token),
+            ).status_code == 401
+            assert user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "managed@example.com",
+                    "password": "replacement-password-123",
+                },
+            ).status_code == 401
+
+            reactivated = root_client.patch(
+                f"/api/platform/users/{managed_user['id']}/status",
+                headers=csrf_headers(root_auth),
+                json={"is_active": True},
+            )
+            assert reactivated.status_code == 200, reactivated.text
+            assert user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "managed@example.com",
+                    "password": "replacement-password-123",
+                },
+            ).status_code == 200
+            assert user_client.get(
+                "/api/agent/environments",
+                headers=agent_headers(replacement_token),
+            ).status_code == 401
+
+            reserved = root_client.post(
+                "/api/platform/users",
+                headers=csrf_headers(root_auth),
+                json={
+                    "email": "reserved-root@example.com",
+                    "display_name": "Reserved Root",
+                    "password": "reserved-password-123",
+                },
+            )
+            assert reserved.status_code == 201, reserved.text
+            assert reserved.json()["user"]["is_superadmin"] is True
+            assert root_client.patch(
+                f"/api/platform/users/{reserved.json()['user']['id']}/status",
+                headers=csrf_headers(root_auth),
+                json={"is_active": False},
+            ).status_code == 409
+            root_user = current_session(root_client)["user"]
+            assert root_client.patch(
+                f"/api/platform/users/{root_user['id']}/status",
+                headers=csrf_headers(root_auth),
+                json={"is_active": False},
+            ).status_code == 409
+
+            audit = root_client.get("/api/audit").json()["entries"]
+            lifecycle_entries = [
+                entry
+                for entry in audit
+                if entry["action"].startswith("platform.user_")
+            ]
+            assert {
+                "platform.user_created",
+                "platform.user_password_reset",
+                "platform.user_status_changed",
+            } <= {entry["action"] for entry in lifecycle_entries}
+            assert all(
+                entry["actor_id"] == root_user["id"]
+                and entry["details"]["platform_superadmin"] is True
+                for entry in lifecycle_entries
+            )
+    finally:
+        app.state.engine.dispose()
+
+
+def test_platform_user_directory_manages_cross_team_memberships(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'platform-memberships.db'}"
+    bootstrap_settings = CloudSettings(
+        database_url=database_url,
+        secret_key="platform-membership-test-secret-with-at-least-thirty-two-bytes",
+        cookie_secure=False,
+        assets_dir=Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "ui",
+    )
+    bootstrap_app = create_app(bootstrap_settings)
+    try:
+        with TestClient(bootstrap_app) as root_client, TestClient(
+            bootstrap_app
+        ) as owner_client:
+            register(root_client, "root@example.com", "Platform Root", "Platform Team")
+            register(owner_client, "owner@example.com", "Owner", "Owner Team")
+    finally:
+        bootstrap_app.state.engine.dispose()
+
+    settings = CloudSettings(
+        database_url=database_url,
+        secret_key="platform-membership-test-secret-with-at-least-thirty-two-bytes",
+        cookie_secure=False,
+        assets_dir=Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "ui",
+        superadmin_emails=frozenset({"root@example.com"}),
+    )
+    app = create_app(settings)
+    try:
+        with (
+            TestClient(app) as root_client,
+            TestClient(app) as owner_client,
+            TestClient(app) as user_client,
+        ):
+            root_auth = login(root_client, "root@example.com")
+            owner_auth = login(owner_client, "owner@example.com")
+            owner_organization_id = owner_auth["organization"]["id"]
+            created = root_client.post(
+                "/api/platform/users",
+                headers=csrf_headers(root_auth),
+                json={
+                    "email": "member@example.com",
+                    "display_name": "Managed Member",
+                    "password": "managed-password-123",
+                },
+            )
+            assert created.status_code == 201, created.text
+            managed_user = created.json()["user"]
+
+            platform_membership_path = (
+                f"/api/platform/users/{managed_user['id']}/memberships"
+            )
+            assert owner_client.post(
+                platform_membership_path,
+                headers=csrf_headers(owner_auth),
+                json={
+                    "organization_id": owner_organization_id,
+                    "role": "member",
+                },
+            ).status_code == 403
+            added = root_client.post(
+                platform_membership_path,
+                headers=csrf_headers(root_auth),
+                json={
+                    "organization_id": owner_organization_id,
+                    "role": "member",
+                },
+            )
+            assert added.status_code == 201, added.text
+            membership = added.json()["membership"]
+            assert membership["organization_name"] == "Owner Team"
+            assert membership["role"] == "member"
+            assert root_client.post(
+                platform_membership_path,
+                headers=csrf_headers(root_auth),
+                json={
+                    "organization_id": owner_organization_id,
+                    "role": "viewer",
+                },
+            ).status_code == 409
+
+            listed_users = root_client.get("/api/platform/users").json()["users"]
+            listed_user = next(
+                item for item in listed_users if item["id"] == managed_user["id"]
+            )
+            assert listed_user["memberships"] == [membership]
+
+            environment = owner_client.post(
+                "/api/environments",
+                headers=csrf_headers(owner_auth),
+                json={
+                    "name": "Cross-team Account",
+                    "storage_policy": "shared",
+                    "assigned_membership_ids": [membership["id"]],
+                    "config": {"fingerprint_seed": 97531},
+                },
+            ).json()["environment"]
+            device_login = user_client.post(
+                "/api/client/login",
+                json={
+                    "email": "member@example.com",
+                    "password": "managed-password-123",
+                    "device_uid": str(uuid.uuid4()),
+                    "device_name": "Cross-team Desktop",
+                    "capabilities": {
+                        "browser_launch": True,
+                        "snapshot_sync": True,
+                        "secret_sync": True,
+                        "extension_sync": True,
+                    },
+                },
+            )
+            assert device_login.status_code == 200, device_login.text
+            device_token = device_login.json()["device_token"]
+            acquired = user_client.post(
+                "/api/agent/leases/acquire",
+                headers=agent_headers(device_token),
+                json={"environment_id": environment["id"]},
+            )
+            assert acquired.status_code == 201, acquired.text
+            lease = acquired.json()
+            membership_item_path = f"{platform_membership_path}/{membership['id']}"
+
+            role_conflict = root_client.patch(
+                membership_item_path,
+                headers=csrf_headers(root_auth),
+                json={"role": "viewer"},
+            )
+            assert role_conflict.status_code == 409
+            assert "running environments" in role_conflict.json()["detail"]
+            remove_conflict = root_client.delete(
+                membership_item_path,
+                headers=csrf_headers(root_auth),
+            )
+            assert remove_conflict.status_code == 409
+            proof = {
+                "lease_id": lease["lease"]["lease_id"],
+                "lease_token": lease["lease_token"],
+                "fencing_token": lease["lease"]["fencing_token"],
+            }
+            assert user_client.post(
+                f"/api/agent/leases/{environment['id']}/release",
+                headers=agent_headers(device_token),
+                json=proof,
+            ).status_code == 204
+
+            changed = root_client.patch(
+                membership_item_path,
+                headers=csrf_headers(root_auth),
+                json={"role": "viewer"},
+            )
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["membership"]["role"] == "viewer"
+            assert user_client.get(
+                "/api/agent/environments",
+                headers=agent_headers(device_token),
+            ).status_code == 401
+            owner_environments = owner_client.get("/api/environments").json()[
+                "environments"
+            ]
+            changed_environment = next(
+                item for item in owner_environments if item["id"] == environment["id"]
+            )
+            assert changed_environment["assigned_membership_ids"] == []
+
+            restored_role = root_client.patch(
+                membership_item_path,
+                headers=csrf_headers(root_auth),
+                json={"role": "member"},
+            )
+            assert restored_role.status_code == 200, restored_role.text
+            assert user_client.get(
+                "/api/agent/environments",
+                headers=agent_headers(device_token),
+            ).status_code == 401
+            removed = root_client.delete(
+                membership_item_path,
+                headers=csrf_headers(root_auth),
+            )
+            assert removed.status_code == 204, removed.text
+            assert user_client.post(
+                "/api/auth/login",
+                json={
+                    "email": "member@example.com",
+                    "password": "managed-password-123",
+                },
+            ).status_code == 403
+
+            platform_users = root_client.get("/api/platform/users").json()["users"]
+            owner_user = next(
+                item for item in platform_users if item["email"] == "owner@example.com"
+            )
+            owner_membership = next(
+                item
+                for item in owner_user["memberships"]
+                if item["organization_id"] == owner_organization_id
+            )
+            owner_membership_path = (
+                f"/api/platform/users/{owner_user['id']}/memberships/"
+                f"{owner_membership['id']}"
+            )
+            assert root_client.patch(
+                owner_membership_path,
+                headers=csrf_headers(root_auth),
+                json={"role": "admin"},
+            ).status_code == 409
+            assert root_client.delete(
+                owner_membership_path,
+                headers=csrf_headers(root_auth),
+            ).status_code == 409
+
+            switched = root_client.post(
+                "/api/session/organization",
+                headers=csrf_headers(root_auth),
+                json={"organization_id": owner_organization_id},
+            )
+            assert switched.status_code == 200, switched.text
+            target_audit = root_client.get("/api/audit").json()["entries"]
+            directory_entries = [
+                entry
+                for entry in target_audit
+                if entry["details"].get("source") == "platform_user_directory"
+            ]
+            assert {entry["action"] for entry in directory_entries} == {
+                "member.added",
+                "member.role_changed",
+                "member.removed",
+            }
+            assert all(
+                entry["actor_id"] == root_auth["user"]["id"]
+                and entry["details"]["platform_superadmin"] is True
+                for entry in directory_entries
+            )
+    finally:
+        app.state.engine.dispose()
+
+
+def test_member_assignments_and_desktop_device_are_environment_scoped(cloud_app):
+    with TestClient(cloud_app) as owner_client, TestClient(cloud_app) as member_client:
+        owner_auth = register(owner_client, "owner@example.com", "Owner", "Owner Team")
+        member_auth = register(member_client, "member@example.com", "Member", "Personal")
+        added = owner_client.post(
+            "/api/members",
+            headers=csrf_headers(owner_auth),
+            json={"email": "member@example.com", "role": "member"},
+        )
+        assert added.status_code == 201, added.text
+        membership = added.json()["member"]
+
+        assigned = owner_client.post(
+            "/api/environments",
+            headers=csrf_headers(owner_auth),
+            json={
+                "name": "Assigned Account",
+                "storage_policy": "shared",
+                "assigned_membership_ids": [membership["id"]],
+                "config": {"fingerprint_seed": 45678},
+            },
+        )
+        assert assigned.status_code == 201, assigned.text
+        assigned_environment = assigned.json()["environment"]
+        assert assigned_environment["assigned_membership_ids"] == [membership["id"]]
+
+        unassigned = owner_client.post(
+            "/api/environments",
+            headers=csrf_headers(owner_auth),
+            json={
+                "name": "Private Account",
+                "storage_policy": "shared",
+                "config": {"fingerprint_seed": 56789},
+            },
+        ).json()["environment"]
+        local_assignment = owner_client.post(
+            "/api/environments",
+            headers=csrf_headers(owner_auth),
+            json={
+                "name": "Invalid Local Assignment",
+                "storage_policy": "local",
+                "assigned_membership_ids": [membership["id"]],
+                "config": {},
+            },
+        )
+        assert local_assignment.status_code == 409
+
+        member_session = current_session(member_client)
+        owner_team = next(
+            organization
+            for organization in member_session["organizations"]
+            if organization["name"] == "Owner Team"
+        )
+        switched = member_client.post(
+            "/api/session/organization",
+            headers={"X-CSRF-Token": member_session["csrf_token"]},
+            json={"organization_id": owner_team["id"]},
+        )
+        assert switched.status_code == 200, switched.text
+        visible = member_client.get("/api/environments").json()["environments"]
+        assert [environment["id"] for environment in visible] == [
+            assigned_environment["id"]
+        ]
+
+        device_uid = str(uuid.uuid4())
+        login_payload = {
+            "email": "member@example.com",
+            "password": "correct-horse-battery-staple",
+            "device_uid": device_uid,
+            "device_name": "Member Mac",
+            "hostname": "member-mac",
+            "platform": "Darwin arm64",
+            "version": "0.5.2",
+            "capabilities": {
+                "browser_launch": True,
+                "snapshot_sync": True,
+                "secret_sync": True,
+                "extension_sync": True,
+            },
+        }
+        device_login = member_client.post(
+            "/api/client/login",
+            json=login_payload,
+        )
+        assert device_login.status_code == 200, device_login.text
+        device = device_login.json()
+        assert device["device_token"].startswith("cb_device_")
+        assert device["agent"]["kind"] == "desktop"
+        assert owner_client.post(
+            f"/api/agents/{device['agent']['id']}/rotate-token",
+            headers=csrf_headers(owner_auth),
+        ).status_code == 409
+        device_auth = agent_headers(device["device_token"])
+        device_environments = member_client.get(
+            "/api/agent/environments", headers=device_auth
+        ).json()["environments"]
+        assert [environment["id"] for environment in device_environments] == [
+            assigned_environment["id"]
+        ]
+        assert member_client.post(
+            "/api/agent/leases/acquire",
+            headers=device_auth,
+            json={"environment_id": unassigned["id"]},
+        ).status_code == 404
+
+        queued = member_client.post(
+            f"/api/agent/environments/{assigned_environment['id']}/launch",
+            headers=device_auth,
+            json={"expected_revision": assigned_environment["revision"]},
+        )
+        assert queued.status_code == 202, queued.text
+        claimed = member_client.post(
+            "/api/agent/tasks/claim", headers=device_auth
+        )
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["task"]["environment_id"] == assigned_environment["id"]
+
+        repeated_login = member_client.post("/api/client/login", json=login_payload)
+        assert repeated_login.status_code == 200, repeated_login.text
+        replacement_token = repeated_login.json()["device_token"]
+        assert replacement_token != device["device_token"]
+        assert member_client.get(
+            "/api/agent/environments", headers=device_auth
+        ).status_code == 401
+        assert member_client.get(
+            "/api/agent/environments", headers=agent_headers(replacement_token)
+        ).status_code == 200
+
+        changed_role = owner_client.patch(
+            f"/api/members/{membership['id']}",
+            headers=csrf_headers(owner_auth),
+            json={"role": "viewer"},
+        )
+        assert changed_role.status_code == 200, changed_role.text
+        assert member_client.get(
+            "/api/agent/environments", headers=agent_headers(replacement_token)
+        ).status_code == 401
+        owner_environments = owner_client.get("/api/environments").json()["environments"]
+        updated_environment = next(
+            environment
+            for environment in owner_environments
+            if environment["id"] == assigned_environment["id"]
+        )
+        assert updated_environment["assigned_membership_ids"] == []
+
+
+def test_client_login_requires_member_role(client):
+    register(client)
+    response = client.post(
+        "/api/client/login",
+        json={
+            "email": "owner@example.com",
+            "password": "correct-horse-battery-staple",
+            "device_uid": str(uuid.uuid4()),
+            "device_name": "Owner Desktop",
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "desktop access requires a member account"
+
+
+def test_desktop_member_can_create_self_assigned_cloud_environment(
+    cloud_app, tmp_path
+):
+    with (
+        TestClient(cloud_app) as owner_client,
+        TestClient(cloud_app) as member_client,
+        TestClient(cloud_app) as other_client,
+    ):
+        owner_auth = register(owner_client, "owner@example.com", "Owner", "Owner Team")
+        member_auth = register(member_client, "member@example.com", "Member", "Personal")
+        other_auth = register(other_client, "other@example.com", "Other", "Other Team")
+        member = owner_client.post(
+            "/api/members",
+            headers=csrf_headers(owner_auth),
+            json={"email": member_auth["user"]["email"], "role": "member"},
+        ).json()["member"]
+        owner_client.post(
+            "/api/members",
+            headers=csrf_headers(owner_auth),
+            json={"email": other_auth["user"]["email"], "role": "member"},
+        )
+        managed_agent = create_agent(owner_client, owner_auth)
+        managed_create = owner_client.post(
+            "/api/agent/environments",
+            headers=agent_headers(managed_agent["agent_token"]),
+            json={"name": "Managed Agent Escape"},
+        )
+        assert managed_create.status_code == 403
+        assert managed_create.json()["detail"] == "desktop device credentials required"
+
+        login_payload = {
+            "email": "member@example.com",
+            "password": "correct-horse-battery-staple",
+            "organization_id": owner_auth["organization"]["id"],
+            "device_uid": str(uuid.uuid4()),
+            "device_name": "Member Desktop",
+            "capabilities": {
+                "browser_launch": True,
+                "snapshot_sync": True,
+                "secret_sync": True,
+            },
+        }
+        device_login = member_client.post("/api/client/login", json=login_payload)
+        assert device_login.status_code == 200, device_login.text
+        device_auth = agent_headers(device_login.json()["device_token"])
+
+        invalid_local = member_client.post(
+            "/api/agent/environments",
+            headers=device_auth,
+            json={"name": "Local Only", "storage_policy": "local"},
+        )
+        assert invalid_local.status_code == 422
+        arbitrary_assignment = member_client.post(
+            "/api/agent/environments",
+            headers=device_auth,
+            json={
+                "name": "Assignment Escape",
+                "assigned_membership_ids": [str(uuid.uuid4())],
+            },
+        )
+        assert arbitrary_assignment.status_code == 422
+
+        created_response = member_client.post(
+            "/api/agent/environments",
+            headers=device_auth,
+            json={
+                "name": "Self-created Account",
+                "tags": ["Sales", "sales"],
+                "storage_policy": "shared",
+                "proxy": "http://proxy-user:proxy-pass@127.0.0.1:8118",
+                "config": {
+                    "fingerprint_seed": 24680,
+                    "timezone": "America/New_York",
+                    "location": "new-york",
+                    "locale": "en-US",
+                    "fingerprint_platform": "windows",
+                    "fingerprint_brand": "Chrome",
+                    "fingerprint_brand_version": "150.0.1.2",
+                    "fingerprint_platform_version": "10.0.0",
+                },
+            },
+        )
+        assert created_response.status_code == 201, created_response.text
+        environment = created_response.json()["environment"]
+        assert environment["storage_policy"] == "shared"
+        assert environment["assigned_membership_ids"] == [member["id"]]
+        assert environment["tags"] == ["Sales"]
+        assert environment["config"]["fingerprint_seed"] == 24680
+        assert environment["proxy_configured"] is True
+        assert environment["proxy_masked"] == "http://***@127.0.0.1:8118"
+        assert "proxy-pass" not in created_response.text
+
+        listed = member_client.get(
+            "/api/agent/environments", headers=device_auth
+        ).json()["environments"]
+        assert [item["id"] for item in listed] == [environment["id"]]
+
+        other_login = other_client.post(
+            "/api/client/login",
+            json={
+                **login_payload,
+                "email": "other@example.com",
+                "device_uid": str(uuid.uuid4()),
+                "device_name": "Other Desktop",
+            },
+        )
+        assert other_login.status_code == 200, other_login.text
+        other_auth_headers = agent_headers(other_login.json()["device_token"])
+        assert other_client.get(
+            "/api/agent/environments", headers=other_auth_headers
+        ).json()["environments"] == []
+        assert other_client.post(
+            "/api/agent/leases/acquire",
+            headers=other_auth_headers,
+            json={"environment_id": environment["id"]},
+        ).status_code == 404
+
+        lease_response = member_client.post(
+            "/api/agent/leases/acquire",
+            headers=device_auth,
+            json={"environment_id": environment["id"]},
+        )
+        assert lease_response.status_code == 201, lease_response.text
+        lease = lease_response.json()
+        proof = {
+            "lease_id": lease["lease"]["lease_id"],
+            "lease_token": lease["lease_token"],
+            "fencing_token": lease["lease"]["fencing_token"],
+        }
+        assets = member_client.post(
+            f"/api/agent/environments/{environment['id']}/runtime-assets",
+            headers=device_auth,
+            json=proof,
+        )
+        assert assets.status_code == 200, assets.text
+        assert assets.json()["proxy"] == (
+            "http://proxy-user:proxy-pass@127.0.0.1:8118"
+        )
+
+        manifest = member_client.post(
+            f"/api/agent/snapshots/{environment['id']}",
+            headers=device_auth,
+            json=proof,
+        ).json()
+        assert manifest["version"] == 0
+        browser_data = tmp_path / "self-created-profile"
+        (browser_data / "Default").mkdir(parents=True)
+        (browser_data / "Default" / "Cookies").write_bytes(b"member-login-state")
+        encrypted_path = tmp_path / "self-created.cbsnap"
+        artifact = create_encrypted_snapshot(
+            browser_data,
+            encrypted_path,
+            decode_snapshot_key(manifest["encryption_key"]),
+            environment["id"],
+            1,
+            max_snapshot_bytes=manifest["max_snapshot_bytes"],
+        )
+        uploaded = member_client.put(
+            f"/api/agent/snapshots/{environment['id']}/content",
+            headers={
+                **device_auth,
+                "X-CB-Lease-Id": proof["lease_id"],
+                "X-CB-Lease-Token": proof["lease_token"],
+                "X-CB-Fencing-Token": str(proof["fencing_token"]),
+                "X-CB-Snapshot-Expected-Version": "0",
+                "X-CB-Snapshot-Plaintext-Size": str(artifact.plaintext_size),
+                "X-CB-Snapshot-SHA256": artifact.sha256,
+                "Content-Type": "application/vnd.cloakbrowser.snapshot",
+            },
+            content=encrypted_path.read_bytes(),
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        assert uploaded.json()["snapshot"]["version"] == 1
+
+        audit_entry = next(
+            entry
+            for entry in owner_client.get("/api/audit").json()["entries"]
+            if entry["target_id"] == environment["id"]
+            and entry["action"] == "environment.created"
+        )
+        assert audit_entry["actor_id"] == member_auth["user"]["id"]
+        assert audit_entry["details"]["source"] == "desktop_workspace"
+
+
+def test_only_member_accounts_can_be_assigned(client):
+    auth = register(client)
+    owner_membership = client.get("/api/members").json()["members"][0]
+    response = client.post(
+        "/api/environments",
+        headers=csrf_headers(auth),
+        json={
+            "name": "Owner Assignment",
+            "storage_policy": "shared",
+            "assigned_membership_ids": [owner_membership["id"]],
+            "config": {},
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "environments can only be assigned to member accounts"
+
+
 def test_last_owner_cannot_be_demoted_or_removed(client):
     auth = register(client)
     member = client.get("/api/members").json()["members"][0]
@@ -369,6 +1409,24 @@ def test_cloud_settings_refuse_insecure_public_bind(tmp_path):
         weak.validate_bind("0.0.0.0")
 
 
+def test_cloud_settings_parse_superadmin_email_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS",
+        " Root@Example.COM, ops@example.com ",
+    )
+    settings = CloudSettings.from_env(str(tmp_path / "valid-superadmins"))
+    assert settings.superadmin_emails == frozenset(
+        {"root@example.com", "ops@example.com"}
+    )
+
+    monkeypatch.setenv(
+        "CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS",
+        "root@example.com,not-an-email",
+    )
+    with pytest.raises(ValueError, match="CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS"):
+        CloudSettings.from_env(str(tmp_path / "invalid-superadmins"))
+
+
 def test_cloud_snapshot_master_key_is_private_and_strictly_decoded(tmp_path, monkeypatch):
     monkeypatch.delenv("CLOAKBROWSER_CLOUD_SNAPSHOT_KEY", raising=False)
     settings = CloudSettings.from_env(str(tmp_path / "cloud-settings"))
@@ -397,6 +1455,144 @@ def test_cloud_cli_parser_defaults():
     assert args.host == "127.0.0.1"
     assert args.port == 8777
     assert args.no_open is True
+
+
+def test_workspace_cli_parser_and_private_device_identity(tmp_path):
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    workspace_cli.add_workspace_parser(sub)
+    args = parser.parse_args(
+        [
+            "workspace",
+            "--cloud-url",
+            "https://cloud.example.com",
+            "--email",
+            "member@example.com",
+            "--once",
+        ]
+    )
+    assert args.command == "workspace"
+    assert args.once is True
+    root = tmp_path / "workspace"
+    first = workspace_cli.load_or_create_device_uid(root)
+    second = workspace_cli.load_or_create_device_uid(root)
+    assert first == second == str(uuid.UUID(first))
+    if os.name != "nt":
+        assert (root / "device.json").stat().st_mode & 0o077 == 0
+
+
+def test_workspace_application_keeps_credentials_out_of_public_state(
+    tmp_path, monkeypatch
+):
+    environment_id = str(uuid.uuid4())
+
+    class FakeWorkspaceClient:
+        instance = None
+
+        def __init__(self, cloud_url, token):
+            self.cloud_url = cloud_url
+            self.token = token
+            self.created_payload = None
+            self.closed = False
+            self.environments = []
+            self.__class__.instance = self
+
+        def list_environments(self):
+            return list(self.environments)
+
+        def create_environment(self, payload):
+            self.created_payload = payload
+            environment = {
+                "id": environment_id,
+                "name": payload["name"],
+                "tags": payload["tags"],
+                "storage_policy": payload["storage_policy"],
+                "config": dict(payload["config"]),
+                "proxy_configured": True,
+                "proxy_masked": "http://***@proxy.example:8080",
+                "revision": 1,
+            }
+            self.environments = [environment]
+            return environment
+
+        def request_launch(self, requested_id, expected_revision):
+            assert requested_id == environment_id
+            assert expected_revision == 1
+            return {"task": {"id": str(uuid.uuid4())}}
+
+        def request_stop(self, requested_id):
+            assert requested_id == environment_id
+            return {"task": {"id": str(uuid.uuid4())}}
+
+        def close(self):
+            self.closed = True
+
+    class FakeWorkspaceRuntime:
+        def __init__(self, api, _root, **kwargs):
+            self.api = api
+            self.state_reporter = kwargs["state_reporter"]
+            self.shutdown_called = False
+
+        def run(self):
+            return None
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    def fake_login_device(*_args, **_kwargs):
+        return {
+            "device_token": "cb_device_private-token-material",
+            "user": {
+                "id": str(uuid.uuid4()),
+                "email": "member@example.com",
+                "display_name": "Member",
+            },
+            "organization": {
+                "id": str(uuid.uuid4()),
+                "name": "Cloud Team",
+                "role": "member",
+            },
+            "agent": {"id": str(uuid.uuid4()), "name": "Member Desktop"},
+            "environments": [],
+        }
+
+    monkeypatch.setattr(workspace_app, "CloudAgentClient", FakeWorkspaceClient)
+    monkeypatch.setattr(workspace_app, "AgentRuntime", FakeWorkspaceRuntime)
+    monkeypatch.setattr(workspace_app, "login_device", fake_login_device)
+
+    app = workspace_app.WorkspaceApplication(
+        "https://cloud.example.com",
+        tmp_path / "workspace",
+    )
+    app.login("member@example.com", "cloud-password")
+    api = FakeWorkspaceClient.instance
+    assert api is not None
+    assert api.token == "cb_device_private-token-material"
+
+    raw_proxy = "http://proxy-user:proxy-password@proxy.example:8080"
+    created = app.create_environment(
+        {
+            "name": "Desktop Created",
+            "tags": ["Sales"],
+            "storage_policy": "shared",
+            "proxy": raw_proxy,
+            "config": {"fingerprint_seed": 13579},
+        }
+    )
+    assert created["id"] == environment_id
+    assert api.created_payload["proxy"] == raw_proxy
+    app.launch(environment_id)
+    app.stop(environment_id)
+
+    public_json = json.dumps(app.public_state())
+    assert "cloud-password" not in public_json
+    assert "cb_device_" not in public_json
+    assert "proxy-password" not in public_json
+    assert "http://***@proxy.example:8080" in public_json
+    app.logout()
+    assert api.closed is True
 
 
 def create_agent(client, auth, name="Runner One"):
@@ -628,6 +1824,9 @@ def test_concurrent_agent_claims_have_one_winner(cloud_app):
 
 
 def test_agent_cli_rejects_insecure_remote_url_and_runs_once(monkeypatch, capsys):
+    assert agent_cli.heartbeat_payload()["capabilities"]["profile_key_portable"] is (
+        platform.system() in {"Darwin", "Linux"}
+    )
     assert agent_cli.validate_cloud_url("http://127.0.0.1:8777/") == (
         "http://127.0.0.1:8777"
     )
@@ -1507,6 +2706,25 @@ def test_snapshot_crypto_round_trip_and_authentication(tmp_path):
     assert (restored / "Default" / "IndexedDB" / "state.db").read_bytes() == b"index-db"
     assert not (restored / "SingletonLock").exists()
 
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    (protected / "keep.txt").write_text("local-data", encoding="utf-8")
+
+    def reject_restored(_restore_root):
+        raise RuntimeError("incompatible profile key")
+
+    with pytest.raises(RuntimeError, match="incompatible profile key"):
+        restore_encrypted_snapshot(
+            encrypted,
+            protected,
+            key,
+            environment_id,
+            1,
+            max_unpacked_bytes=16 * 1024 * 1024,
+            validate_restored=reject_restored,
+        )
+    assert (protected / "keep.txt").read_text(encoding="utf-8") == "local-data"
+
     tampered = bytearray(encrypted.read_bytes())
     tampered[-1] ^= 1
     encrypted.write_bytes(tampered)
@@ -1727,6 +2945,7 @@ class FakeRuntimeAssetAPI(FakeAgentAPI):
 def test_agent_runtime_launches_and_stops_persistent_browser(tmp_path):
     api = FakeAgentAPI()
     launched = []
+    phases = []
 
     def launcher(data_dir, **options):
         context = FakeBrowserContext()
@@ -1740,6 +2959,9 @@ def test_agent_runtime_launches_and_stops_persistent_browser(tmp_path):
         launcher=launcher,
         launch_timeout=2,
         stop_timeout=2,
+        state_reporter=lambda environment_id, phase, details: phases.append(
+            (environment_id, phase, details)
+        ),
     )
     environment_id = str(uuid.uuid4())
     task_token = "cb_task_" + "t" * 48
@@ -1810,6 +3032,12 @@ def test_agent_runtime_launches_and_stops_persistent_browser(tmp_path):
         "accuracy": 50.0,
     }
     assert launched[0][1]["permissions"] == ["geolocation"]
+    assert [item[1] for item in phases[:4]] == [
+        "acquiring_lease",
+        "fetching_assets",
+        "starting",
+        "running",
+    ]
 
     lease_id = api.completed[-1]["result"]["lease_id"]
     runtime.process_claimed_task(
@@ -1825,6 +3053,7 @@ def test_agent_runtime_launches_and_stops_persistent_browser(tmp_path):
         }
     )
     assert api.completed[-1]["status"] == "succeeded"
+    assert [item[1] for item in phases[-2:]] == ["stopping", "stopped"]
     assert launched[0][2].closed is True
     assert api.released[-1][0] == environment_id
     runtime.shutdown()
@@ -1862,7 +3091,10 @@ def test_agent_runtime_syncs_snapshot_between_agent_data_directories(tmp_path):
             "task_token": "cb_task_" + "s" * 48,
         }
 
-    def first_launcher(data_dir, **_options):
+    launch_options = []
+
+    def first_launcher(data_dir, **options):
+        launch_options.append(options)
         default_dir = Path(data_dir) / "Default"
         default_dir.mkdir(parents=True, exist_ok=True)
         (default_dir / "Cookies").write_bytes(b"state-from-agent-a")
@@ -1889,12 +3121,28 @@ def test_agent_runtime_syncs_snapshot_between_agent_data_directories(tmp_path):
     )
     assert api.completed[-1]["status"] == "succeeded"
     assert api.completed[-1]["result"]["snapshot_version"] == 1
+    assert api.completed[-1]["result"]["profile_crypto"]["portable"] is True
     assert api.snapshot_version == 1
+    profile_metadata_path = (
+        tmp_path
+        / "agent-a"
+        / "browser-data"
+        / environment_id
+        / ".cloakbrowser-cloud-profile.json"
+    )
+    profile_metadata = json.loads(profile_metadata_path.read_text(encoding="utf-8"))
+    if platform.system() == "Darwin":
+        assert profile_metadata["backend"] == "mock-keychain"
+        assert "--use-mock-keychain" in launch_options[0]["args"]
+    elif platform.system() == "Linux":
+        assert profile_metadata["backend"] == "basic-password-store"
+        assert "--password-store=basic" in launch_options[0]["args"]
     first.shutdown()
 
     restored_values = []
 
-    def second_launcher(data_dir, **_options):
+    def second_launcher(data_dir, **options):
+        launch_options.append(options)
         cookie_path = Path(data_dir) / "Default" / "Cookies"
         restored_values.append(cookie_path.read_bytes())
         cookie_path.write_bytes(b"state-from-agent-b")
@@ -1924,6 +3172,162 @@ def test_agent_runtime_syncs_snapshot_between_agent_data_directories(tmp_path):
     assert api.completed[-1]["result"]["snapshot_version"] == 2
     assert api.snapshot_version == 2
     second.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("source_system", "target_system", "expected_error"),
+    [
+        ("Darwin", "Linux", "encrypted for macos/mock-keychain"),
+        ("Windows", "Windows", "machine-bound key store"),
+    ],
+)
+def test_agent_runtime_rejects_incompatible_profile_key_store(
+    tmp_path,
+    source_system,
+    target_system,
+    expected_error,
+):
+    api = FakeSnapshotAgentAPI()
+    environment_id = str(uuid.uuid4())
+    environment = {
+        "id": environment_id,
+        "name": "Profile Key Boundary",
+        "revision": 1,
+        "storage_policy": "shared",
+        "config": {
+            "fingerprint_seed": 31415,
+            "storage_quota_mb": 5000,
+            "startup_url": "about:blank",
+        },
+    }
+
+    def task(kind, payload):
+        return {
+            "task": {
+                "id": str(uuid.uuid4()),
+                "kind": kind,
+                "environment_id": environment_id,
+                "environment_revision": 1,
+                "payload": payload,
+            },
+            "task_token": "cb_task_" + "k" * 48,
+        }
+
+    source_options = []
+
+    def source_launcher(data_dir, **options):
+        source_options.append(options)
+        default_dir = Path(data_dir) / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        (default_dir / "Cookies").write_bytes(b"encrypted-login-state")
+        return FakeBrowserContext()
+
+    source = AgentRuntime(
+        api,
+        tmp_path / "source-agent",
+        heartbeat_payload={},
+        launcher=source_launcher,
+        launch_timeout=2,
+        stop_timeout=2,
+        system_name=source_system,
+    )
+    source.process_claimed_task(task("launch", {"environment": environment}))
+    source_lease = api.completed[-1]["result"]
+    source.process_claimed_task(
+        task(
+            "stop",
+            {
+                "lease_id": source_lease["lease_id"],
+                "fencing_token": source_lease["fencing_token"],
+            },
+        )
+    )
+    assert api.completed[-1]["status"] == "succeeded"
+    if source_system == "Darwin":
+        assert "--use-mock-keychain" in source_options[0]["args"]
+    source.shutdown()
+
+    target_launches = 0
+
+    def target_launcher(_data_dir, **_options):
+        nonlocal target_launches
+        target_launches += 1
+        return FakeBrowserContext()
+
+    target = AgentRuntime(
+        api,
+        tmp_path / "target-agent",
+        heartbeat_payload={},
+        launcher=target_launcher,
+        launch_timeout=2,
+        stop_timeout=2,
+        system_name=target_system,
+    )
+    target.process_claimed_task(task("launch", {"environment": environment}))
+    assert api.completed[-1]["status"] == "failed"
+    assert expected_error in api.completed[-1]["error"]
+    assert target_launches == 0
+    target.shutdown()
+
+
+def test_agent_runtime_rejects_legacy_snapshot_on_new_agent(tmp_path):
+    api = FakeSnapshotAgentAPI()
+    environment_id = str(uuid.uuid4())
+    legacy_profile = tmp_path / "legacy-profile"
+    (legacy_profile / "Default").mkdir(parents=True)
+    (legacy_profile / "Default" / "Cookies").write_bytes(b"legacy-login-state")
+    encrypted = tmp_path / "legacy.cbsnap"
+    artifact = create_encrypted_snapshot(
+        legacy_profile,
+        encrypted,
+        api.snapshot_key,
+        environment_id,
+        1,
+        max_snapshot_bytes=16 * 1024 * 1024,
+    )
+    api.snapshot_version = 1
+    api.snapshot_content = encrypted.read_bytes()
+    api.snapshot_sha256 = artifact.sha256
+    environment = {
+        "id": environment_id,
+        "name": "Legacy Profile",
+        "revision": 1,
+        "storage_policy": "backup",
+        "config": {"fingerprint_seed": 27182, "storage_quota_mb": 5000},
+    }
+    launches = 0
+
+    def launcher(_data_dir, **_options):
+        nonlocal launches
+        launches += 1
+        return FakeBrowserContext()
+
+    runtime = AgentRuntime(
+        api,
+        tmp_path / "new-agent",
+        heartbeat_payload={},
+        launcher=launcher,
+        launch_timeout=2,
+        stop_timeout=2,
+        system_name="Darwin",
+    )
+    runtime.process_claimed_task(
+        {
+            "task": {
+                "id": str(uuid.uuid4()),
+                "kind": "launch",
+                "environment_id": environment_id,
+                "environment_revision": 1,
+                "payload": {"environment": environment},
+            },
+            "task_token": "cb_task_" + "l" * 48,
+        }
+    )
+    assert api.completed[-1]["status"] == "failed"
+    assert "predates profile-key metadata" in api.completed[-1]["error"]
+    assert launches == 0
+    assert not (runtime.browser_data_dir / environment_id).exists()
+    runtime.shutdown()
 
 
 def test_agent_runtime_loads_proxy_and_caches_extension_package(tmp_path):
@@ -2244,6 +3648,7 @@ def test_cloud_ui_exposes_agent_management():
     assert 'id="environmentConsistencyWarning"' in html
     assert 'id="agentTokenDialog"' in html
     assert "renderAgents" in javascript
+    assert "const portable = agent.capabilities?.profile_key_portable" in javascript
     assert "renderTasks" in javascript
     assert "requestEnvironmentLaunch" in javascript
     assert "updateStoragePolicyNotice" in javascript
@@ -2254,3 +3659,7 @@ def test_cloud_ui_exposes_agent_management():
     assert "confirmEnvironmentStop" in javascript
     assert "confirmAgentTokenRotation" in javascript
     assert "fencing_token" in javascript
+    assert "平台超管" in javascript
+    assert "平台访问" in javascript
+    assert "profile_key_portable" in javascript
+    assert "登录态可迁移" in javascript

@@ -22,11 +22,13 @@ from sqlalchemy.orm import Session as DatabaseSession
 from sqlalchemy.orm import joinedload
 
 from .database import create_database_engine, create_session_factory, initialize_database
-from .constants import AGENT_TOKEN_PREFIX
+from .constants import AGENT_TOKEN_PREFIX, DEVICE_TOKEN_PREFIX
 from .models import (
     AuditLog,
     AgentNode,
+    ClientDevice,
     Environment,
+    EnvironmentAssignment,
     EnvironmentExtension,
     EnvironmentLease,
     EnvironmentSecret,
@@ -49,6 +51,9 @@ from .schemas import (
     AgentLeaseProof,
     AgentTaskCompletion,
     AgentTaskProof,
+    AgentSelfLaunchRequest,
+    ClientLoginRequest,
+    DeviceEnvironmentCreate,
     EnvironmentCreate,
     EnvironmentUpdate,
     ExtensionCreate,
@@ -59,6 +64,11 @@ from .schemas import (
     MemberUpdate,
     OrganizationCreate,
     OrganizationSwitch,
+    PlatformMembershipCreate,
+    PlatformMembershipUpdate,
+    PlatformUserCreate,
+    PlatformUserPasswordReset,
+    PlatformUserStatusUpdate,
     RegisterRequest,
     RemoteLaunchRequest,
 )
@@ -68,8 +78,10 @@ from .security import (
     csrf_matches,
     csrf_token,
     hash_password,
+    device_token_digest,
     lease_token_digest,
     new_agent_token,
+    new_device_token,
     new_lease_token,
     new_session_token,
     new_task_token,
@@ -105,15 +117,18 @@ TASK_CLAIM_TTL_SECONDS = 120
 class AuthContext:
     user: User
     organization: Organization
-    membership: Membership
+    membership: Optional[Membership]
+    role: str
     session: Session
     raw_token: str
+    is_superadmin: bool = False
 
 
 @dataclass
 class AgentAuthContext:
     agent: AgentNode
     raw_token: str
+    device: Optional[ClientDevice] = None
 
 
 def _iso(value: datetime) -> str:
@@ -158,12 +173,18 @@ def _user_json(user: User) -> dict[str, Any]:
     }
 
 
-def _organization_json(organization: Organization, role: str) -> dict[str, Any]:
+def _organization_json(
+    organization: Organization,
+    role: str,
+    *,
+    platform_access: bool = False,
+) -> dict[str, Any]:
     return {
         "id": organization.id,
         "name": organization.name,
         "slug": organization.slug,
         "role": role,
+        "platform_access": platform_access,
     }
 
 
@@ -173,6 +194,39 @@ def _member_json(membership: Membership) -> dict[str, Any]:
         "role": membership.role,
         "created_at": _iso(membership.created_at),
         "user": _user_json(membership.user),
+    }
+
+
+def _platform_user_json(
+    user: User,
+    *,
+    device_count: int,
+    active_device_count: int,
+    superadmin_emails: frozenset[str],
+) -> dict[str, Any]:
+    memberships = sorted(
+        user.memberships,
+        key=lambda item: (item.organization.name.lower(), item.created_at),
+    )
+    return {
+        **_user_json(user),
+        "is_active": user.is_active,
+        "is_superadmin": user.email in superadmin_emails,
+        "memberships": [_platform_membership_json(item) for item in memberships],
+        "membership_count": len(memberships),
+        "device_count": device_count,
+        "active_device_count": active_device_count,
+        "created_at": _iso(user.created_at),
+    }
+
+
+def _platform_membership_json(membership: Membership) -> dict[str, Any]:
+    return {
+        "id": membership.id,
+        "organization_id": membership.organization_id,
+        "organization_name": membership.organization.name,
+        "role": membership.role,
+        "created_at": _iso(membership.created_at),
     }
 
 
@@ -192,6 +246,11 @@ def _environment_json(environment: Environment) -> dict[str, Any]:
         link.extension
         for link in environment.extension_links
         if link.extension.status == "ready"
+    ]
+    assignments = [
+        assignment
+        for assignment in environment.assignments
+        if assignment.membership is not None
     ]
     return {
         "id": environment.id,
@@ -213,6 +272,16 @@ def _environment_json(environment: Environment) -> dict[str, Any]:
                 "content_sha256": extension.content_sha256,
             }
             for extension in extensions
+        ],
+        "assigned_membership_ids": [item.membership_id for item in assignments],
+        "assigned_users": [
+            {
+                "membership_id": item.membership_id,
+                "user_id": item.membership.user_id,
+                "display_name": item.membership.user.display_name,
+                "email": item.membership.user.email,
+            }
+            for item in assignments
         ],
         "revision": environment.revision,
         "created_at": _iso(environment.created_at),
@@ -253,6 +322,7 @@ def _agent_json(agent: AgentNode, active_leases: int = 0) -> dict[str, Any]:
         agent_status = "online"
     else:
         agent_status = "offline"
+    device = agent.client_device
     return {
         "id": agent.id,
         "name": agent.name,
@@ -261,6 +331,9 @@ def _agent_json(agent: AgentNode, active_leases: int = 0) -> dict[str, Any]:
         "platform": agent.platform,
         "version": agent.version,
         "capabilities": dict(agent.capabilities or {}),
+        "kind": "desktop" if device is not None else "managed",
+        "user_id": device.user_id if device is not None else None,
+        "user_name": device.user.display_name if device is not None else "",
         "active_leases": active_leases,
         "created_at": _iso(agent.created_at),
         "last_seen_at": _iso(agent.last_seen_at) if agent.last_seen_at else None,
@@ -333,15 +406,20 @@ def _audit(
     target_type: str,
     target_id: str,
     details: Optional[dict[str, Any]] = None,
+    *,
+    organization_id: Optional[str] = None,
 ) -> None:
+    audit_details = dict(details or {})
+    if auth.is_superadmin:
+        audit_details["platform_superadmin"] = True
     db.add(
         AuditLog(
-            organization_id=auth.organization.id,
+            organization_id=organization_id or auth.organization.id,
             actor_id=auth.user.id,
             action=action,
             target_type=target_type,
             target_id=target_id,
-            details=details or {},
+            details=audit_details,
         )
     )
 
@@ -459,6 +537,9 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 db.commit()
             raise HTTPException(status_code=401, detail="session expired")
         user = db.get(User, cloud_session.user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(status_code=401, detail="session is no longer valid")
+        is_superadmin = user.email in settings.superadmin_emails
         membership = db.scalar(
             select(Membership)
             .options(joinedload(Membership.organization))
@@ -467,14 +548,27 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 Membership.organization_id == cloud_session.organization_id,
             )
         )
-        if user is None or not user.is_active or membership is None:
+        organization = (
+            membership.organization
+            if membership is not None
+            else db.get(Organization, cloud_session.organization_id)
+        )
+        if organization is None or (membership is None and not is_superadmin):
+            raise HTTPException(status_code=401, detail="session is no longer valid")
+        if is_superadmin:
+            role = "owner"
+        elif membership is not None:
+            role = membership.role
+        else:
             raise HTTPException(status_code=401, detail="session is no longer valid")
         return AuthContext(
             user=user,
-            organization=membership.organization,
+            organization=organization,
             membership=membership,
+            role=role,
             session=cloud_session,
             raw_token=raw_token,
+            is_superadmin=is_superadmin,
         )
 
     def mutation_auth(
@@ -494,28 +588,122 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         if (
             not separator
             or scheme.lower() != "bearer"
-            or not raw_token.startswith(AGENT_TOKEN_PREFIX)
+            or not raw_token.startswith((AGENT_TOKEN_PREFIX, DEVICE_TOKEN_PREFIX))
             or len(raw_token) > 160
         ):
             raise HTTPException(status_code=401, detail="invalid agent credentials")
-        agent = db.scalar(
-            select(AgentNode).where(
-                AgentNode.token_digest == agent_token_digest(raw_token)
+        device: Optional[ClientDevice] = None
+        if raw_token.startswith(DEVICE_TOKEN_PREFIX):
+            device = db.scalar(
+                select(ClientDevice)
+                .options(
+                    joinedload(ClientDevice.agent),
+                    joinedload(ClientDevice.user),
+                    joinedload(ClientDevice.membership),
+                )
+                .where(ClientDevice.token_digest == device_token_digest(raw_token))
             )
-        )
+            agent = device.agent if device is not None else None
+            if (
+                device is not None
+                and (
+                    not device.user.is_active
+                    or device.membership.role != "member"
+                    or device.membership.user_id != device.user_id
+                    or device.membership.organization_id != device.organization_id
+                    or agent is None
+                    or agent.organization_id != device.organization_id
+                )
+            ):
+                device = None
+                agent = None
+        else:
+            agent = db.scalar(
+                select(AgentNode)
+                .options(joinedload(AgentNode.client_device).joinedload(ClientDevice.user))
+                .where(AgentNode.token_digest == agent_token_digest(raw_token))
+            )
+            if agent is not None and agent.client_device is not None:
+                agent = None
         if agent is None or agent.revoked_at is not None:
             raise HTTPException(status_code=401, detail="invalid agent credentials")
-        return AgentAuthContext(agent=agent, raw_token=raw_token)
+        return AgentAuthContext(agent=agent, raw_token=raw_token, device=device)
 
     def permission(name: str, *, mutation: bool = False) -> Callable[..., AuthContext]:
         dependency = mutation_auth if mutation else current_auth
 
         def require(auth: AuthContext = Depends(dependency)) -> AuthContext:
-            if not has_permission(auth.membership.role, name):
+            if not has_permission(auth.role, name):
                 raise HTTPException(status_code=403, detail="permission denied")
             return auth
 
         return require
+
+    def platform_superadmin(*, mutation: bool = False) -> Callable[..., AuthContext]:
+        dependency = mutation_auth if mutation else current_auth
+
+        def require(auth: AuthContext = Depends(dependency)) -> AuthContext:
+            if not auth.is_superadmin:
+                raise HTTPException(status_code=403, detail="platform administrator required")
+            return auth
+
+        return require
+
+    def user_environment_query(auth: AuthContext) -> Any:
+        query = select(Environment).where(
+            Environment.organization_id == auth.organization.id
+        )
+        if auth.role == "member" and auth.membership is not None:
+            query = query.where(
+                Environment.assignments.any(
+                    EnvironmentAssignment.membership_id == auth.membership.id
+                )
+            )
+        return query
+
+    def require_user_environment(
+        db: DatabaseSession,
+        auth: AuthContext,
+        environment_id: str,
+    ) -> Environment:
+        environment = db.scalar(
+            user_environment_query(auth).where(Environment.id == environment_id)
+        )
+        if environment is None:
+            raise HTTPException(status_code=404, detail="environment not found")
+        return environment
+
+    def require_agent_environment(
+        db: DatabaseSession,
+        auth: AgentAuthContext,
+        environment_id: str,
+    ) -> Environment:
+        query = select(Environment).where(
+            Environment.id == environment_id,
+            Environment.organization_id == auth.agent.organization_id,
+        )
+        if auth.device is not None:
+            query = query.where(
+                Environment.assignments.any(
+                    EnvironmentAssignment.membership_id == auth.device.membership_id
+                )
+            )
+        environment = db.scalar(query)
+        if environment is None:
+            raise HTTPException(status_code=404, detail="environment not found")
+        return environment
+
+    def require_user_agent(
+        db: DatabaseSession,
+        auth: AuthContext,
+        agent_id: str,
+    ) -> AgentNode:
+        agent = require_managed_agent(db, auth.organization.id, agent_id)
+        if auth.role == "member" and auth.membership is not None:
+            device = agent.client_device
+            if device is None or device.membership_id != auth.membership.id:
+                raise HTTPException(status_code=404, detail="agent not found")
+        return agent
 
     def issue_session(
         db: DatabaseSession,
@@ -553,6 +741,14 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         response: Response,
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
+        if payload.email in settings.superadmin_emails:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "platform administrator accounts must be created before "
+                    "enabling the superadmin allowlist"
+                ),
+            )
         if db.scalar(select(User.id).where(User.email == payload.email)):
             raise HTTPException(status_code=409, detail="an account with this email already exists")
         user = User(
@@ -597,7 +793,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         raw_token, _ = issue_session(db, response, user, organization.id)
         return {
             "user": _user_json(user),
-            "organization": _organization_json(organization, membership.role),
+            "organization": _organization_json(
+                organization,
+                membership.role,
+            ),
             "csrf_token": csrf_token(settings.secret_key, raw_token),
         }
 
@@ -620,13 +819,163 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             .where(Membership.user_id == user.id)
             .order_by(Membership.created_at)
         )
-        if membership is None:
+        is_superadmin = user.email in settings.superadmin_emails
+        organization = membership.organization if membership is not None else None
+        if membership is None and is_superadmin:
+            organization = db.scalar(select(Organization).order_by(Organization.created_at))
+        if organization is None:
             raise HTTPException(status_code=403, detail="account does not belong to a team")
-        raw_token, _ = issue_session(db, response, user, membership.organization_id)
+        raw_token, _ = issue_session(db, response, user, organization.id)
+        if is_superadmin:
+            role = "owner"
+        elif membership is not None:
+            role = membership.role
+        else:
+            raise HTTPException(status_code=403, detail="account does not belong to a team")
+        return {
+            "user": _user_json(user),
+            "organization": _organization_json(
+                organization,
+                role,
+                platform_access=is_superadmin,
+            ),
+            "csrf_token": csrf_token(settings.secret_key, raw_token),
+        }
+
+    @app.post("/api/client/login")
+    def client_login(
+        payload: ClientLoginRequest,
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        user = db.scalar(select(User).where(User.email == payload.email))
+        if (
+            user is None
+            or not user.is_active
+            or not verify_password(user.password_hash, payload.password)
+        ):
+            raise HTTPException(status_code=401, detail="invalid email or password")
+        memberships = db.scalars(
+            select(Membership)
+            .options(joinedload(Membership.organization))
+            .where(Membership.user_id == user.id)
+            .order_by(Membership.created_at)
+        ).all()
+        if payload.organization_id:
+            membership = next(
+                (
+                    item
+                    for item in memberships
+                    if item.organization_id == payload.organization_id
+                ),
+                None,
+            )
+        else:
+            membership = next(
+                (item for item in memberships if item.role == "member"),
+                memberships[0] if memberships else None,
+            )
+        if membership is None:
+            raise HTTPException(status_code=403, detail="account does not belong to this team")
+        if membership.role != "member":
+            raise HTTPException(
+                status_code=403,
+                detail="desktop access requires a member account",
+            )
+
+        device = db.scalar(
+            select(ClientDevice)
+            .options(joinedload(ClientDevice.agent))
+            .where(
+                ClientDevice.organization_id == membership.organization_id,
+                ClientDevice.user_id == user.id,
+                ClientDevice.device_uid == payload.device_uid,
+            )
+        )
+        if device is not None and device.agent.revoked_at is not None:
+            db.delete(device)
+            db.flush()
+            device = None
+        raw_token = new_device_token()
+        now = utc_now()
+        if device is None:
+            base_name = payload.device_name
+            name = base_name
+            suffix = 2
+            while db.scalar(
+                select(AgentNode.id).where(
+                    AgentNode.organization_id == membership.organization_id,
+                    AgentNode.name == name,
+                )
+            ):
+                tail = f" {suffix}"
+                name = f"{base_name[:100 - len(tail)]}{tail}"
+                suffix += 1
+            agent = AgentNode(
+                organization_id=membership.organization_id,
+                name=name,
+                token_digest=agent_token_digest(new_agent_token()),
+                hostname=payload.hostname,
+                platform=payload.platform,
+                version=payload.version,
+                capabilities=dict(payload.capabilities),
+                created_by=user.id,
+                last_seen_at=now,
+            )
+            db.add(agent)
+            db.flush()
+            device = ClientDevice(
+                organization_id=membership.organization_id,
+                user_id=user.id,
+                membership_id=membership.id,
+                agent_id=agent.id,
+                device_uid=payload.device_uid,
+                token_digest=device_token_digest(raw_token),
+                last_login_at=now,
+            )
+            db.add(device)
+            action = "client_device.created"
+        else:
+            agent = device.agent
+            device.membership_id = membership.id
+            device.token_digest = device_token_digest(raw_token)
+            device.last_login_at = now
+            agent.hostname = payload.hostname
+            agent.platform = payload.platform
+            agent.version = payload.version
+            agent.capabilities = dict(payload.capabilities)
+            agent.last_seen_at = now
+            action = "client_device.logged_in"
+        db.add(
+            AuditLog(
+                organization_id=membership.organization_id,
+                actor_id=user.id,
+                action=action,
+                target_type="agent",
+                target_id=agent.id,
+                details={"device_uid": payload.device_uid},
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="device registration conflicted") from exc
+        environments = db.scalars(
+            select(Environment)
+            .where(
+                Environment.organization_id == membership.organization_id,
+                Environment.assignments.any(
+                    EnvironmentAssignment.membership_id == membership.id
+                ),
+            )
+            .order_by(Environment.updated_at.desc())
+        ).all()
         return {
             "user": _user_json(user),
             "organization": _organization_json(membership.organization, membership.role),
-            "csrf_token": csrf_token(settings.secret_key, raw_token),
+            "agent": _agent_json(agent),
+            "device_token": raw_token,
+            "environments": [_environment_json(item) for item in environments],
         }
 
     @app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -646,19 +995,35 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(current_auth),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        memberships = db.scalars(
-            select(Membership)
-            .options(joinedload(Membership.organization))
-            .where(Membership.user_id == auth.user.id)
-            .order_by(Membership.created_at)
-        ).all()
+        if auth.is_superadmin:
+            organizations = db.scalars(
+                select(Organization).order_by(Organization.created_at)
+            ).all()
+            organization_items = [
+                _organization_json(item, "owner", platform_access=True)
+                for item in organizations
+            ]
+        else:
+            memberships = db.scalars(
+                select(Membership)
+                .options(joinedload(Membership.organization))
+                .where(Membership.user_id == auth.user.id)
+                .order_by(Membership.created_at)
+            ).all()
+            organization_items = [
+                _organization_json(item.organization, item.role)
+                for item in memberships
+            ]
         return {
             "user": _user_json(auth.user),
-            "organization": _organization_json(auth.organization, auth.membership.role),
-            "organizations": [
-                _organization_json(item.organization, item.role) for item in memberships
-            ],
-            "permissions": sorted(ROLE_PERMISSIONS[auth.membership.role]),
+            "organization": _organization_json(
+                auth.organization,
+                auth.role,
+                platform_access=auth.is_superadmin,
+            ),
+            "organizations": organization_items,
+            "permissions": sorted(ROLE_PERMISSIONS[auth.role]),
+            "is_superadmin": auth.is_superadmin,
             "csrf_token": csrf_token(settings.secret_key, auth.raw_token),
         }
 
@@ -668,19 +1033,46 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(mutation_auth),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        membership = db.scalar(
-            select(Membership)
-            .options(joinedload(Membership.organization))
-            .where(
-                Membership.user_id == auth.user.id,
-                Membership.organization_id == payload.organization_id,
+        if auth.is_superadmin:
+            organization = db.get(Organization, payload.organization_id)
+            role = "owner"
+        else:
+            membership = db.scalar(
+                select(Membership)
+                .options(joinedload(Membership.organization))
+                .where(
+                    Membership.user_id == auth.user.id,
+                    Membership.organization_id == payload.organization_id,
+                )
             )
-        )
-        if membership is None:
+            organization = membership.organization if membership is not None else None
+            role = membership.role if membership is not None else ""
+        if organization is None:
             raise HTTPException(status_code=404, detail="team not found")
-        auth.session.organization_id = membership.organization_id
+        previous_organization_id = auth.session.organization_id
+        auth.session.organization_id = organization.id
+        if auth.is_superadmin:
+            db.add(
+                AuditLog(
+                    organization_id=organization.id,
+                    actor_id=auth.user.id,
+                    action="platform.organization_accessed",
+                    target_type="organization",
+                    target_id=organization.id,
+                    details={
+                        "from_organization_id": previous_organization_id,
+                        "platform_superadmin": True,
+                    },
+                )
+            )
         db.commit()
-        return {"organization": _organization_json(membership.organization, membership.role)}
+        return {
+            "organization": _organization_json(
+                organization,
+                role,
+                platform_access=auth.is_superadmin,
+            )
+        }
 
     @app.post("/api/organizations", status_code=status.HTTP_201_CREATED)
     def create_organization(
@@ -709,7 +1101,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 action="organization.created",
                 target_type="organization",
                 target_id=organization.id,
-                details={"name": organization.name},
+                details={
+                    "name": organization.name,
+                    "platform_superadmin": auth.is_superadmin,
+                },
             )
         )
         try:
@@ -717,7 +1112,419 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(status_code=409, detail="team name already exists") from exc
-        return {"organization": _organization_json(organization, membership.role)}
+        return {
+            "organization": _organization_json(
+                organization,
+                "owner",
+                platform_access=auth.is_superadmin,
+            )
+        }
+
+    @app.get("/api/platform/users")
+    def list_platform_users(
+        _auth: AuthContext = Depends(platform_superadmin()),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        users = db.scalars(
+            select(User)
+            .options(joinedload(User.memberships).joinedload(Membership.organization))
+            .order_by(User.created_at, User.email)
+        ).unique().all()
+        device_counts = dict(
+            db.execute(
+                select(ClientDevice.user_id, func.count(ClientDevice.id))
+                .group_by(ClientDevice.user_id)
+            ).all()
+        )
+        active_device_counts = dict(
+            db.execute(
+                select(ClientDevice.user_id, func.count(ClientDevice.id))
+                .join(AgentNode, AgentNode.id == ClientDevice.agent_id)
+                .where(AgentNode.revoked_at.is_(None))
+                .group_by(ClientDevice.user_id)
+            ).all()
+        )
+        return {
+            "users": [
+                _platform_user_json(
+                    user,
+                    device_count=int(device_counts.get(user.id, 0)),
+                    active_device_count=int(active_device_counts.get(user.id, 0)),
+                    superadmin_emails=settings.superadmin_emails,
+                )
+                for user in users
+            ]
+        }
+
+    @app.post("/api/platform/users", status_code=status.HTTP_201_CREATED)
+    def create_platform_user(
+        payload: PlatformUserCreate,
+        auth: AuthContext = Depends(platform_superadmin(mutation=True)),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        if db.scalar(select(User.id).where(User.email == payload.email)):
+            raise HTTPException(status_code=409, detail="an account with this email already exists")
+        user = User(
+            email=payload.email,
+            display_name=payload.display_name,
+            password_hash=hash_password(payload.password),
+        )
+        db.add(user)
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="an account with this email already exists",
+            ) from exc
+        _audit(
+            db,
+            auth,
+            "platform.user_created",
+            "user",
+            user.id,
+            {
+                "email": user.email,
+                "is_superadmin": user.email in settings.superadmin_emails,
+            },
+        )
+        db.commit()
+        return {
+            "user": _platform_user_json(
+                user,
+                device_count=0,
+                active_device_count=0,
+                superadmin_emails=settings.superadmin_emails,
+            )
+        }
+
+    def get_platform_user(
+        db: DatabaseSession,
+        user_id: str,
+    ) -> User:
+        user = db.scalar(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+        )
+        if user is None:
+            raise HTTPException(status_code=404, detail="user not found")
+        return user
+
+    def revoke_platform_user_credentials(
+        db: DatabaseSession,
+        user: User,
+        *,
+        active_lease_detail: str,
+        task_error: str,
+    ) -> dict[str, int]:
+        device_agent_ids = db.scalars(
+            select(ClientDevice.agent_id).where(ClientDevice.user_id == user.id)
+        ).all()
+        if device_agent_ids:
+            active_lease = db.scalar(
+                select(EnvironmentLease.environment_id).where(
+                    EnvironmentLease.agent_id.in_(device_agent_ids),
+                    EnvironmentLease.lease_token_digest.is_not(None),
+                    EnvironmentLease.expires_at.is_not(None),
+                    EnvironmentLease.expires_at > utc_now(),
+                )
+            )
+            if active_lease is not None:
+                raise HTTPException(status_code=409, detail=active_lease_detail)
+
+        now = utc_now()
+        revoked_devices = 0
+        failed_tasks = 0
+        if device_agent_ids:
+            revoked = db.execute(
+                update(AgentNode)
+                .where(
+                    AgentNode.id.in_(device_agent_ids),
+                    AgentNode.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            )
+            revoked_devices = int(revoked.rowcount or 0)
+            failed = db.execute(
+                update(RemoteTask)
+                .where(
+                    RemoteTask.agent_id.in_(device_agent_ids),
+                    RemoteTask.status.in_(("pending", "claimed")),
+                )
+                .values(
+                    status="failed",
+                    dedupe_key=None,
+                    claim_token_digest=None,
+                    error=task_error,
+                    completed_at=now,
+                    updated_at=now,
+                )
+            )
+            failed_tasks = int(failed.rowcount or 0)
+        revoked_sessions = db.execute(
+            delete(Session).where(Session.user_id == user.id)
+        )
+        return {
+            "sessions_revoked": int(revoked_sessions.rowcount or 0),
+            "devices_revoked": revoked_devices,
+            "tasks_failed": failed_tasks,
+        }
+
+    @app.patch("/api/platform/users/{user_id}/status")
+    def update_platform_user_status(
+        user_id: str,
+        payload: PlatformUserStatusUpdate,
+        auth: AuthContext = Depends(platform_superadmin(mutation=True)),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        user = get_platform_user(db, user_id)
+        if not payload.is_active:
+            if user.id == auth.user.id:
+                raise HTTPException(status_code=409, detail="platform administrators cannot deactivate themselves")
+            if user.email in settings.superadmin_emails:
+                raise HTTPException(status_code=409, detail="configured platform administrators cannot be deactivated")
+        if user.is_active == payload.is_active:
+            return {"user": {**_user_json(user), "is_active": user.is_active}}
+
+        credential_counts = {
+            "sessions_revoked": 0,
+            "devices_revoked": 0,
+            "tasks_failed": 0,
+        }
+        previous_status = user.is_active
+        if not payload.is_active:
+            credential_counts = revoke_platform_user_credentials(
+                db,
+                user,
+                active_lease_detail=(
+                    "stop the user's running environments before deactivating the account"
+                ),
+                task_error="platform user was deactivated before the task completed",
+            )
+        user.is_active = payload.is_active
+        _audit(
+            db,
+            auth,
+            "platform.user_status_changed",
+            "user",
+            user.id,
+            {
+                "email": user.email,
+                "from": "active" if previous_status else "inactive",
+                "to": "active" if user.is_active else "inactive",
+                **credential_counts,
+            },
+        )
+        db.commit()
+        return {
+            "user": {**_user_json(user), "is_active": user.is_active},
+            **credential_counts,
+        }
+
+    @app.patch("/api/platform/users/{user_id}/password")
+    def reset_platform_user_password(
+        user_id: str,
+        payload: PlatformUserPasswordReset,
+        auth: AuthContext = Depends(platform_superadmin(mutation=True)),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        user = get_platform_user(db, user_id)
+        credential_counts = revoke_platform_user_credentials(
+            db,
+            user,
+            active_lease_detail=(
+                "stop the user's running environments before resetting the password"
+            ),
+            task_error="platform user password was reset before the task completed",
+        )
+        user.password_hash = hash_password(payload.password)
+        _audit(
+            db,
+            auth,
+            "platform.user_password_reset",
+            "user",
+            user.id,
+            {"email": user.email, **credential_counts},
+        )
+        db.commit()
+        return credential_counts
+
+    def get_platform_membership(
+        db: DatabaseSession,
+        user_id: str,
+        membership_id: str,
+    ) -> Membership:
+        membership = db.scalar(
+            select(Membership)
+            .options(
+                joinedload(Membership.user),
+                joinedload(Membership.organization),
+            )
+            .where(
+                Membership.id == membership_id,
+                Membership.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if membership is None:
+            raise HTTPException(status_code=404, detail="team membership not found")
+        return membership
+
+    @app.post(
+        "/api/platform/users/{user_id}/memberships",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_platform_membership(
+        user_id: str,
+        payload: PlatformMembershipCreate,
+        auth: AuthContext = Depends(platform_superadmin(mutation=True)),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        user = get_platform_user(db, user_id)
+        organization = db.scalar(
+            select(Organization)
+            .where(Organization.id == payload.organization_id)
+            .with_for_update()
+        )
+        if organization is None:
+            raise HTTPException(status_code=404, detail="team not found")
+        if db.scalar(
+            select(Membership.id).where(
+                Membership.organization_id == organization.id,
+                Membership.user_id == user.id,
+            )
+        ):
+            raise HTTPException(status_code=409, detail="user is already a team member")
+        membership = Membership(
+            organization_id=organization.id,
+            user_id=user.id,
+            role=payload.role,
+        )
+        db.add(membership)
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="user is already a team member",
+            ) from exc
+        membership.user = user
+        membership.organization = organization
+        _audit(
+            db,
+            auth,
+            "member.added",
+            "membership",
+            membership.id,
+            {
+                "user_id": user.id,
+                "role": payload.role,
+                "source": "platform_user_directory",
+            },
+            organization_id=organization.id,
+        )
+        db.commit()
+        return {"membership": _platform_membership_json(membership)}
+
+    @app.patch(
+        "/api/platform/users/{user_id}/memberships/{membership_id}"
+    )
+    def update_platform_membership(
+        user_id: str,
+        membership_id: str,
+        payload: PlatformMembershipUpdate,
+        auth: AuthContext = Depends(platform_superadmin(mutation=True)),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        target = get_platform_membership(db, user_id, membership_id)
+        if target.role == "owner" and payload.role != "owner":
+            ensure_owner_remains(db, target.organization_id, target)
+        old_role = target.role
+        retired_devices = 0
+        unassigned_environments = 0
+        if old_role == "member" and payload.role != "member":
+            retired_devices = retire_member_devices(
+                db,
+                target.organization_id,
+                target,
+                active_lease_detail=(
+                    "stop the user's running environments before changing their team role"
+                ),
+                task_error="platform user role changed before the task completed",
+            )
+            unassigned = db.execute(
+                delete(EnvironmentAssignment).where(
+                    EnvironmentAssignment.membership_id == target.id
+                )
+            )
+            unassigned_environments = int(unassigned.rowcount or 0)
+        target.role = payload.role
+        _audit(
+            db,
+            auth,
+            "member.role_changed",
+            "membership",
+            target.id,
+            {
+                "from": old_role,
+                "to": payload.role,
+                "user_id": target.user_id,
+                "devices_retired": retired_devices,
+                "environments_unassigned": unassigned_environments,
+                "source": "platform_user_directory",
+            },
+            organization_id=target.organization_id,
+        )
+        db.commit()
+        return {"membership": _platform_membership_json(target)}
+
+    @app.delete(
+        "/api/platform/users/{user_id}/memberships/{membership_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def delete_platform_membership(
+        user_id: str,
+        membership_id: str,
+        auth: AuthContext = Depends(platform_superadmin(mutation=True)),
+        db: DatabaseSession = Depends(get_db),
+    ) -> Response:
+        target = get_platform_membership(db, user_id, membership_id)
+        if target.user_id == auth.user.id and target.organization_id == auth.organization.id:
+            raise HTTPException(
+                status_code=409,
+                detail="current users cannot remove themselves from the active team",
+            )
+        ensure_owner_remains(db, target.organization_id, target)
+        retired_devices = retire_member_devices(
+            db,
+            target.organization_id,
+            target,
+            active_lease_detail=(
+                "stop the user's running environments before removing their team access"
+            ),
+            task_error="platform user team access was removed before the task completed",
+        )
+        target_user_id = target.user_id
+        target_organization_id = target.organization_id
+        db.delete(target)
+        _audit(
+            db,
+            auth,
+            "member.removed",
+            "membership",
+            target.id,
+            {
+                "user_id": target_user_id,
+                "devices_retired": retired_devices,
+                "source": "platform_user_directory",
+            },
+            organization_id=target_organization_id,
+        )
+        db.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/api/members")
     def list_members(
@@ -738,7 +1545,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("members.manage", mutation=True)),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        if payload.role == "owner" and auth.membership.role != "owner":
+        if payload.role == "owner" and auth.role != "owner":
             raise HTTPException(status_code=403, detail="only owners can assign the owner role")
         user = db.scalar(select(User).where(User.email == payload.email))
         if user is None:
@@ -789,26 +1596,80 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         )
         if target is None:
             raise HTTPException(status_code=404, detail="member not found")
-        if target.role == "owner" and auth.membership.role != "owner":
+        if target.role == "owner" and auth.role != "owner":
             raise HTTPException(status_code=403, detail="only owners can manage owners")
         return target
 
-    def ensure_owner_remains(db: DatabaseSession, auth: AuthContext, target: Membership) -> None:
+    def ensure_owner_remains(
+        db: DatabaseSession,
+        organization_id: str,
+        target: Membership,
+    ) -> None:
         if target.role != "owner":
             return
         db.scalar(
             select(Organization)
-            .where(Organization.id == auth.organization.id)
+            .where(Organization.id == organization_id)
             .with_for_update()
         )
         owner_count = db.scalar(
             select(func.count(Membership.id)).where(
-                Membership.organization_id == auth.organization.id,
+                Membership.organization_id == organization_id,
                 Membership.role == "owner",
             )
         )
         if int(owner_count or 0) <= 1:
             raise HTTPException(status_code=409, detail="the team must keep at least one owner")
+
+    def retire_member_devices(
+        db: DatabaseSession,
+        organization_id: str,
+        target: Membership,
+        *,
+        active_lease_detail: str,
+        task_error: str,
+    ) -> int:
+        devices = db.scalars(
+            select(ClientDevice)
+            .options(joinedload(ClientDevice.agent))
+            .where(ClientDevice.membership_id == target.id)
+        ).all()
+        device_agent_ids = [device.agent_id for device in devices]
+        if not device_agent_ids:
+            return 0
+        active_device_lease = db.scalar(
+            select(EnvironmentLease.environment_id).where(
+                EnvironmentLease.organization_id == organization_id,
+                EnvironmentLease.agent_id.in_(device_agent_ids),
+                EnvironmentLease.lease_token_digest.is_not(None),
+                EnvironmentLease.expires_at.is_not(None),
+                EnvironmentLease.expires_at > utc_now(),
+            )
+        )
+        if active_device_lease is not None:
+            raise HTTPException(status_code=409, detail=active_lease_detail)
+        now = utc_now()
+        db.execute(
+            update(AgentNode)
+            .where(AgentNode.id.in_(device_agent_ids))
+            .values(revoked_at=now)
+        )
+        db.execute(
+            update(RemoteTask)
+            .where(
+                RemoteTask.agent_id.in_(device_agent_ids),
+                RemoteTask.status.in_(("pending", "claimed")),
+            )
+            .values(
+                status="failed",
+                dedupe_key=None,
+                claim_token_digest=None,
+                error=task_error,
+                completed_at=now,
+                updated_at=now,
+            )
+        )
+        return len(device_agent_ids)
 
     @app.patch("/api/members/{membership_id}")
     def update_member(
@@ -818,11 +1679,29 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
         target = get_managed_membership(db, auth, membership_id)
-        if payload.role == "owner" and auth.membership.role != "owner":
+        if payload.role == "owner" and auth.role != "owner":
             raise HTTPException(status_code=403, detail="only owners can assign the owner role")
         if target.role == "owner" and payload.role != "owner":
-            ensure_owner_remains(db, auth, target)
+            ensure_owner_remains(db, auth.organization.id, target)
         old_role = target.role
+        retired_devices = 0
+        unassigned_environments = 0
+        if old_role == "member" and payload.role != "member":
+            retired_devices = retire_member_devices(
+                db,
+                auth.organization.id,
+                target,
+                active_lease_detail=(
+                    "stop the member's running environments before changing their role"
+                ),
+                task_error="member role changed before the task completed",
+            )
+            unassigned = db.execute(
+                delete(EnvironmentAssignment).where(
+                    EnvironmentAssignment.membership_id == target.id
+                )
+            )
+            unassigned_environments = int(unassigned.rowcount or 0)
         target.role = payload.role
         _audit(
             db,
@@ -830,7 +1709,13 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             "member.role_changed",
             "membership",
             target.id,
-            {"from": old_role, "to": payload.role, "user_id": target.user_id},
+            {
+                "from": old_role,
+                "to": payload.role,
+                "user_id": target.user_id,
+                "devices_retired": retired_devices,
+                "environments_unassigned": unassigned_environments,
+            },
         )
         db.commit()
         return {"member": _member_json(target)}
@@ -847,7 +1732,16 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 status_code=409,
                 detail="current users cannot remove themselves from the active team",
             )
-        ensure_owner_remains(db, auth, target)
+        ensure_owner_remains(db, auth.organization.id, target)
+        retire_member_devices(
+            db,
+            auth.organization.id,
+            target,
+            active_lease_detail=(
+                "stop the member's running environments before removing them"
+            ),
+            task_error="member was removed before the task completed",
+        )
         target_user_id = target.user_id
         db.delete(target)
         _audit(
@@ -881,11 +1775,19 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("agents.read")),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        agents = db.scalars(
+        agent_query = (
             select(AgentNode)
+            .options(joinedload(AgentNode.client_device).joinedload(ClientDevice.user))
             .where(AgentNode.organization_id == auth.organization.id)
             .order_by(AgentNode.created_at)
-        ).all()
+        )
+        if auth.role == "member" and auth.membership is not None:
+            agent_query = agent_query.where(
+                AgentNode.client_device.has(
+                    ClientDevice.membership_id == auth.membership.id
+                )
+            )
+        agents = db.scalars(agent_query).all()
         now = utc_now()
         lease_counts = dict(
             db.execute(
@@ -939,6 +1841,11 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         agent = require_managed_agent(db, auth.organization.id, agent_id)
         if agent.revoked_at is not None:
             raise HTTPException(status_code=409, detail="revoked agents cannot rotate tokens")
+        if agent.client_device is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="desktop device credentials rotate when the user signs in",
+            )
         raw_token = new_agent_token()
         agent.token_digest = agent_token_digest(raw_token)
         _audit(db, auth, "agent.token_rotated", "agent", agent.id)
@@ -1006,7 +1913,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
         now = utc_now()
-        leases = db.scalars(
+        lease_query = (
             select(EnvironmentLease)
             .options(
                 joinedload(EnvironmentLease.environment),
@@ -1020,7 +1927,16 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 EnvironmentLease.expires_at > now,
             )
             .order_by(EnvironmentLease.expires_at)
-        ).all()
+        )
+        if auth.role == "member" and auth.membership is not None:
+            lease_query = lease_query.where(
+                EnvironmentLease.environment.has(
+                    Environment.assignments.any(
+                        EnvironmentAssignment.membership_id == auth.membership.id
+                    )
+                )
+            )
+        leases = db.scalars(lease_query).all()
         return {"leases": [_lease_json(lease) for lease in leases]}
 
     def active_environment_lease(
@@ -1085,7 +2001,8 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
 
     def set_environment_proxy(
         db: DatabaseSession,
-        auth: AuthContext,
+        organization_id: str,
+        actor_id: str,
         environment_id: str,
         proxy: str,
     ) -> None:
@@ -1094,7 +2011,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         envelope = (
             encrypt_environment_secret(
                 snapshot_master_key,
-                auth.organization.id,
+                organization_id,
                 environment_id,
                 "proxy",
                 next_version,
@@ -1106,18 +2023,18 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         if secret is None:
             secret = EnvironmentSecret(
                 environment_id=environment_id,
-                organization_id=auth.organization.id,
+                organization_id=organization_id,
                 proxy_envelope=envelope,
                 proxy_masked=_mask_proxy(proxy) if proxy else "",
                 version=next_version,
-                updated_by=auth.user.id,
+                updated_by=actor_id,
             )
             db.add(secret)
         else:
             secret.proxy_envelope = envelope
             secret.proxy_masked = _mask_proxy(proxy) if proxy else ""
             secret.version = next_version
-            secret.updated_by = auth.user.id
+            secret.updated_by = actor_id
             secret.updated_at = utc_now()
 
     @app.get("/api/extensions")
@@ -1125,11 +2042,22 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("extensions.read")),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        packages = db.scalars(
+        extension_query = (
             select(ExtensionPackage)
             .where(ExtensionPackage.organization_id == auth.organization.id)
             .order_by(ExtensionPackage.created_at.desc())
-        ).all()
+        )
+        if auth.role == "member" and auth.membership is not None:
+            extension_query = extension_query.where(
+                ExtensionPackage.environment_links.any(
+                    EnvironmentExtension.environment.has(
+                        Environment.assignments.any(
+                            EnvironmentAssignment.membership_id == auth.membership.id
+                        )
+                    )
+                )
+            )
+        packages = db.scalars(extension_query).all()
         return {"extensions": [_extension_json(package) for package in packages]}
 
     @app.post("/api/extensions", status_code=status.HTTP_201_CREATED)
@@ -1320,14 +2248,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext = Depends(current_agent),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        environment = db.scalar(
-            select(Environment).where(
-                Environment.id == environment_id,
-                Environment.organization_id == auth.agent.organization_id,
-            )
-        )
-        if environment is None:
-            raise HTTPException(status_code=404, detail="environment not found")
+        environment = require_agent_environment(db, auth, environment_id)
         require_snapshot_lease(db, auth, environment_id, proof)
         proxy = ""
         secret = environment.secret
@@ -1412,17 +2333,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
 
     def require_snapshot_environment(
         db: DatabaseSession,
-        organization_id: str,
+        auth: AgentAuthContext,
         environment_id: str,
     ) -> Environment:
-        environment = db.scalar(
-            select(Environment).where(
-                Environment.id == environment_id,
-                Environment.organization_id == organization_id,
-            )
-        )
-        if environment is None:
-            raise HTTPException(status_code=404, detail="environment not found")
+        environment = require_agent_environment(db, auth, environment_id)
         if environment.storage_policy == "local":
             raise HTTPException(
                 status_code=409,
@@ -1436,6 +2350,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         environment_id: str,
         proof: AgentLeaseProof,
     ) -> EnvironmentLease:
+        require_agent_environment(db, auth, environment_id)
         now = utc_now()
         lease = db.scalar(
             select(EnvironmentLease).where(
@@ -1501,7 +2416,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("snapshots.read")),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        snapshots = db.scalars(
+        snapshot_query = (
             select(EnvironmentSnapshot)
             .options(
                 joinedload(EnvironmentSnapshot.environment),
@@ -1512,7 +2427,16 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 EnvironmentSnapshot.version > 0,
             )
             .order_by(EnvironmentSnapshot.updated_at.desc())
-        ).all()
+        )
+        if auth.role == "member" and auth.membership is not None:
+            snapshot_query = snapshot_query.where(
+                EnvironmentSnapshot.environment.has(
+                    Environment.assignments.any(
+                        EnvironmentAssignment.membership_id == auth.membership.id
+                    )
+                )
+            )
+        snapshots = db.scalars(snapshot_query).all()
         return {"snapshots": [_snapshot_json(item) for item in snapshots]}
 
     @app.post("/api/agent/snapshots/{environment_id}")
@@ -1522,9 +2446,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext = Depends(current_agent),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        environment = require_snapshot_environment(
-            db, auth.agent.organization_id, environment_id
-        )
+        environment = require_snapshot_environment(db, auth, environment_id)
         require_snapshot_lease(db, auth, environment_id, payload)
         snapshot = ensure_snapshot_state(
             db, auth.agent.organization_id, environment_id
@@ -1557,7 +2479,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext = Depends(current_agent),
         db: DatabaseSession = Depends(get_db),
     ) -> Response:
-        require_snapshot_environment(db, auth.agent.organization_id, environment_id)
+        require_snapshot_environment(db, auth, environment_id)
         require_snapshot_lease(db, auth, environment_id, payload)
         snapshot = db.scalar(
             select(EnvironmentSnapshot).where(
@@ -1589,7 +2511,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
         proof = snapshot_proof_from_headers(request)
-        require_snapshot_environment(db, auth.agent.organization_id, environment_id)
+        require_snapshot_environment(db, auth, environment_id)
         require_snapshot_lease(db, auth, environment_id, proof)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/vnd.cloakbrowser.snapshot":
@@ -1858,6 +2780,134 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         )
         return task
 
+    def queue_device_task(
+        db: DatabaseSession,
+        auth: AgentAuthContext,
+        environment: Environment,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> RemoteTask:
+        if auth.device is None:
+            raise HTTPException(status_code=403, detail="desktop device credentials required")
+        task = RemoteTask(
+            organization_id=auth.agent.organization_id,
+            environment_id=environment.id,
+            agent_id=auth.agent.id,
+            kind=kind,
+            status="pending",
+            dedupe_key=environment.id,
+            environment_revision=environment.revision,
+            payload=payload,
+            created_by=auth.device.user_id,
+        )
+        db.add(task)
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="environment already has a pending remote task",
+            ) from exc
+        db.add(
+            AuditLog(
+                organization_id=auth.agent.organization_id,
+                actor_id=auth.device.user_id,
+                action=f"environment.{kind}_requested",
+                target_type="environment",
+                target_id=environment.id,
+                details={"task_id": task.id, "agent_id": auth.agent.id},
+            )
+        )
+        db.commit()
+        task = db.scalar(
+            select(RemoteTask)
+            .options(
+                joinedload(RemoteTask.environment),
+                joinedload(RemoteTask.agent),
+            )
+            .where(RemoteTask.id == task.id)
+        )
+        return task
+
+    @app.post(
+        "/api/agent/environments/{environment_id}/launch",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def request_device_environment_launch(
+        environment_id: str,
+        payload: AgentSelfLaunchRequest,
+        auth: AgentAuthContext = Depends(current_agent),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        if auth.device is None:
+            raise HTTPException(status_code=403, detail="desktop device credentials required")
+        environment = require_agent_environment(db, auth, environment_id)
+        if environment.revision != payload.expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="environment was updated; refresh and retry",
+            )
+        if active_environment_lease(db, auth.agent.organization_id, environment.id):
+            raise HTTPException(status_code=409, detail="environment is already running")
+        capabilities = auth.agent.capabilities or {}
+        if not bool(capabilities.get("browser_launch")):
+            raise HTTPException(status_code=409, detail="this device cannot launch browsers")
+        if environment.storage_policy != "local" and not bool(
+            capabilities.get("snapshot_sync")
+        ):
+            raise HTTPException(status_code=409, detail="this device cannot synchronize snapshots")
+        if environment.secret is not None and environment.secret.proxy_envelope and not bool(
+            capabilities.get("secret_sync")
+        ):
+            raise HTTPException(status_code=409, detail="this device cannot receive proxy secrets")
+        if environment.extension_links and not bool(capabilities.get("extension_sync")):
+            raise HTTPException(status_code=409, detail="this device cannot synchronize extensions")
+        task = queue_device_task(
+            db,
+            auth,
+            environment,
+            "launch",
+            {
+                "environment": {
+                    "id": environment.id,
+                    "name": environment.name,
+                    "revision": environment.revision,
+                    "storage_policy": environment.storage_policy,
+                    "config": dict(environment.config or {}),
+                }
+            },
+        )
+        return {"task": _task_json(task)}
+
+    @app.post(
+        "/api/agent/environments/{environment_id}/stop",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def request_device_environment_stop(
+        environment_id: str,
+        auth: AgentAuthContext = Depends(current_agent),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        if auth.device is None:
+            raise HTTPException(status_code=403, detail="desktop device credentials required")
+        environment = require_agent_environment(db, auth, environment_id)
+        lease = active_environment_lease(db, auth.agent.organization_id, environment.id)
+        if (
+            lease is None
+            or lease.agent_id != auth.agent.id
+            or lease.lease_id is None
+        ):
+            raise HTTPException(status_code=409, detail="environment is not running on this device")
+        task = queue_device_task(
+            db,
+            auth,
+            environment,
+            "stop",
+            {"lease_id": lease.lease_id, "fencing_token": lease.fencing_token},
+        )
+        return {"task": _task_json(task)}
+
     @app.post(
         "/api/environments/{environment_id}/launch",
         status_code=status.HTTP_202_ACCEPTED,
@@ -1868,16 +2918,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("environments.launch", mutation=True)),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        environment = db.scalar(
-            select(Environment)
-            .options(joinedload(Environment.group))
-            .where(
-                Environment.id == environment_id,
-                Environment.organization_id == auth.organization.id,
-            )
-        )
-        if environment is None:
-            raise HTTPException(status_code=404, detail="environment not found")
+        environment = require_user_environment(db, auth, environment_id)
         if environment.revision != payload.expected_revision:
             raise HTTPException(
                 status_code=409,
@@ -1885,7 +2926,12 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             )
         if active_environment_lease(db, auth.organization.id, environment.id):
             raise HTTPException(status_code=409, detail="environment is already running")
-        agent = require_managed_agent(db, auth.organization.id, payload.agent_id)
+        agent = require_user_agent(db, auth, payload.agent_id)
+        if auth.role != "member" and agent.client_device is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="desktop environments must be launched by the assigned user",
+            )
         if not _agent_is_online(agent):
             raise HTTPException(status_code=409, detail="selected agent is offline")
         if not bool((agent.capabilities or {}).get("browser_launch")):
@@ -1938,19 +2984,17 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("environments.launch", mutation=True)),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        environment = db.scalar(
-            select(Environment)
-            .options(joinedload(Environment.group))
-            .where(
-                Environment.id == environment_id,
-                Environment.organization_id == auth.organization.id,
-            )
-        )
-        if environment is None:
-            raise HTTPException(status_code=404, detail="environment not found")
+        environment = require_user_environment(db, auth, environment_id)
         lease = active_environment_lease(db, auth.organization.id, environment.id)
         if lease is None or lease.agent is None or lease.lease_id is None:
             raise HTTPException(status_code=409, detail="environment is not running")
+        if auth.role == "member" and auth.membership is not None:
+            device = lease.agent.client_device
+            if device is None or device.membership_id != auth.membership.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="environment is running on another user's device",
+                )
         task = queue_remote_task(
             db,
             auth,
@@ -1969,7 +3013,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AuthContext = Depends(permission("tasks.read")),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        tasks = db.scalars(
+        query = (
             select(RemoteTask)
             .options(
                 joinedload(RemoteTask.environment),
@@ -1978,7 +3022,17 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             .where(RemoteTask.organization_id == auth.organization.id)
             .order_by(RemoteTask.created_at.desc())
             .limit(200)
-        ).all()
+        )
+        if auth.role == "member" and auth.membership is not None:
+            query = query.where(
+                RemoteTask.created_by == auth.user.id,
+                RemoteTask.environment.has(
+                    Environment.assignments.any(
+                        EnvironmentAssignment.membership_id == auth.membership.id
+                    )
+                ),
+            )
+        tasks = db.scalars(query).all()
         return {"tasks": [_task_json(task) for task in tasks]}
 
     @app.post("/api/agent/tasks/claim")
@@ -2234,13 +3288,95 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext = Depends(current_agent),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
-        environments = db.scalars(
+        environment_query = (
             select(Environment)
             .options(joinedload(Environment.group))
             .where(Environment.organization_id == auth.agent.organization_id)
             .order_by(Environment.updated_at.desc())
-        ).all()
+        )
+        if auth.device is not None:
+            environment_query = environment_query.where(
+                Environment.assignments.any(
+                    EnvironmentAssignment.membership_id == auth.device.membership_id
+                )
+            )
+        environments = db.scalars(environment_query).all()
         return {"environments": [_environment_json(item) for item in environments]}
+
+    @app.post(
+        "/api/agent/environments",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_device_environment(
+        payload: DeviceEnvironmentCreate,
+        auth: AgentAuthContext = Depends(current_agent),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        if auth.device is None:
+            raise HTTPException(status_code=403, detail="desktop device credentials required")
+        device = auth.device
+        environment = Environment(
+            organization_id=device.organization_id,
+            name=payload.name,
+            tags=payload.tags,
+            storage_policy=payload.storage_policy,
+            config=payload.config.model_dump(),
+            created_by=device.user_id,
+            updated_by=device.user_id,
+        )
+        db.add(environment)
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="environment name already exists") from exc
+        if payload.proxy:
+            set_environment_proxy(
+                db,
+                device.organization_id,
+                device.user_id,
+                environment.id,
+                payload.proxy,
+            )
+        db.add(
+            EnvironmentAssignment(
+                environment_id=environment.id,
+                membership_id=device.membership_id,
+                organization_id=device.organization_id,
+                assigned_by=device.user_id,
+            )
+        )
+        db.add(
+            AuditLog(
+                organization_id=device.organization_id,
+                actor_id=device.user_id,
+                action="environment.created",
+                target_type="environment",
+                target_id=environment.id,
+                details={
+                    "source": "desktop_workspace",
+                    "storage_policy": environment.storage_policy,
+                    "proxy_configured": bool(payload.proxy),
+                    "extensions": 0,
+                    "assigned_members": 1,
+                },
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="environment name already exists") from exc
+        db.expire_all()
+        environment = db.scalar(
+            select(Environment)
+            .options(joinedload(Environment.group))
+            .where(
+                Environment.id == environment.id,
+                Environment.organization_id == device.organization_id,
+            )
+        )
+        return {"environment": _environment_json(environment)}
 
     def claim_existing_lease(
         db: DatabaseSession,
@@ -2284,14 +3420,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
     ) -> dict[str, Any]:
         organization_id = auth.agent.organization_id
         environment_id = payload.environment_id
-        environment_exists = db.scalar(
-            select(Environment.id).where(
-                Environment.id == environment_id,
-                Environment.organization_id == organization_id,
-            )
-        )
-        if environment_exists is None:
-            raise HTTPException(status_code=404, detail="environment not found")
+        require_agent_environment(db, auth, environment_id)
 
         now = utc_now()
         expires_at = now + timedelta(seconds=LEASE_TTL_SECONDS)
@@ -2380,6 +3509,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext = Depends(current_agent),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
+        require_agent_environment(db, auth, environment_id)
         now = utc_now()
         expires_at = now + timedelta(seconds=LEASE_TTL_SECONDS)
         renewed = db.execute(
@@ -2470,6 +3600,35 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         if group is None:
             raise HTTPException(status_code=404, detail="group not found")
         return group
+
+    def require_assignment_memberships(
+        db: DatabaseSession,
+        organization_id: str,
+        membership_ids: list[str],
+    ) -> list[Membership]:
+        if not membership_ids:
+            return []
+        memberships = db.scalars(
+            select(Membership)
+            .options(joinedload(Membership.user))
+            .where(
+                Membership.organization_id == organization_id,
+                Membership.id.in_(membership_ids),
+            )
+        ).all()
+        by_id = {membership.id: membership for membership in memberships}
+        if len(by_id) != len(membership_ids):
+            raise HTTPException(
+                status_code=422,
+                detail="one or more assigned members are unavailable",
+            )
+        result = [by_id[membership_id] for membership_id in membership_ids]
+        if any(membership.role != "member" for membership in result):
+            raise HTTPException(
+                status_code=422,
+                detail="environments can only be assigned to member accounts",
+            )
+        return result
 
     @app.get("/api/groups")
     def list_groups(
@@ -2564,9 +3723,8 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
         environments = db.scalars(
-            select(Environment)
+            user_environment_query(auth)
             .options(joinedload(Environment.group))
-            .where(Environment.organization_id == auth.organization.id)
             .order_by(Environment.updated_at.desc())
         ).all()
         return {"environments": [_environment_json(item) for item in environments]}
@@ -2579,6 +3737,20 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
     ) -> dict[str, Any]:
         if payload.group_id:
             require_group(db, auth.organization.id, payload.group_id)
+        if payload.assigned_membership_ids and not has_permission(
+            auth.role, "assignments.manage"
+        ):
+            raise HTTPException(status_code=403, detail="permission denied")
+        if payload.assigned_membership_ids and payload.storage_policy == "local":
+            raise HTTPException(
+                status_code=409,
+                detail="assigned environments must enable cloud storage",
+            )
+        assigned_memberships = require_assignment_memberships(
+            db,
+            auth.organization.id,
+            payload.assigned_membership_ids,
+        )
         packages = require_extension_packages(
             db,
             auth.organization.id,
@@ -2601,13 +3773,28 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             db.rollback()
             raise HTTPException(status_code=409, detail="environment name already exists") from exc
         if payload.proxy:
-            set_environment_proxy(db, auth, environment.id, payload.proxy)
+            set_environment_proxy(
+                db,
+                auth.organization.id,
+                auth.user.id,
+                environment.id,
+                payload.proxy,
+            )
         for position, package in enumerate(packages):
             db.add(
                 EnvironmentExtension(
                     environment_id=environment.id,
                     extension_id=package.id,
                     position=position,
+                )
+            )
+        for membership in assigned_memberships:
+            db.add(
+                EnvironmentAssignment(
+                    environment_id=environment.id,
+                    membership_id=membership.id,
+                    organization_id=auth.organization.id,
+                    assigned_by=auth.user.id,
                 )
             )
         _audit(
@@ -2620,6 +3807,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 "storage_policy": environment.storage_policy,
                 "proxy_configured": bool(payload.proxy),
                 "extensions": len(packages),
+                "assigned_members": len(assigned_memberships),
             },
         )
         db.commit()
@@ -2649,6 +3837,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         )
         if existing is None:
             raise HTTPException(status_code=404, detail="environment not found")
+        if payload.assigned_membership_ids is not None and not has_permission(
+            auth.role, "assignments.manage"
+        ):
+            raise HTTPException(status_code=403, detail="permission denied")
         active_task = db.scalar(
             select(RemoteTask.id).where(
                 RemoteTask.environment_id == environment_id,
@@ -2667,6 +3859,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             or payload.proxy is not None
             or payload.clear_proxy
             or payload.extension_ids is not None
+            or payload.assigned_membership_ids is not None
         ) and active_environment_lease(db, auth.organization.id, environment_id):
             raise HTTPException(
                 status_code=409,
@@ -2686,6 +3879,26 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             if payload.extension_ids is not None
             else None
         )
+        assigned_memberships = (
+            require_assignment_memberships(
+                db,
+                auth.organization.id,
+                payload.assigned_membership_ids,
+            )
+            if payload.assigned_membership_ids is not None
+            else None
+        )
+        resulting_assignment_count = (
+            len(assigned_memberships)
+            if assigned_memberships is not None
+            else len(existing.assignments)
+        )
+        resulting_storage_policy = payload.storage_policy or existing.storage_policy
+        if resulting_assignment_count and resulting_storage_policy == "local":
+            raise HTTPException(
+                status_code=409,
+                detail="assigned environments must enable cloud storage",
+            )
         values: dict[str, Any] = {
             "revision": Environment.revision + 1,
             "updated_by": auth.user.id,
@@ -2722,7 +3935,8 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         if proxy_changed:
             set_environment_proxy(
                 db,
-                auth,
+                auth.organization.id,
+                auth.user.id,
                 environment_id,
                 "" if payload.clear_proxy else (payload.proxy or ""),
             )
@@ -2740,6 +3954,21 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                         position=position,
                     )
                 )
+        if assigned_memberships is not None:
+            db.execute(
+                delete(EnvironmentAssignment).where(
+                    EnvironmentAssignment.environment_id == environment_id
+                )
+            )
+            for membership in assigned_memberships:
+                db.add(
+                    EnvironmentAssignment(
+                        environment_id=environment_id,
+                        membership_id=membership.id,
+                        organization_id=auth.organization.id,
+                        assigned_by=auth.user.id,
+                    )
+                )
         _audit(
             db,
             auth,
@@ -2750,6 +3979,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 "from_revision": payload.expected_revision,
                 "proxy_changed": proxy_changed,
                 "extensions_changed": packages is not None,
+                "assignments_changed": assigned_memberships is not None,
             },
         )
         try:

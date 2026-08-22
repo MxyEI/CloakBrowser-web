@@ -7,6 +7,7 @@ const state = {
   environments: [],
   groups: [],
   members: [],
+  platformUsers: [],
   extensions: [],
   agents: [],
   leases: [],
@@ -17,6 +18,15 @@ const state = {
   launchingEnvironment: null,
   confirmAction: null,
   workspaceLoading: false,
+};
+
+const PLATFORM_ROLES = ["member", "viewer", "operator", "admin", "owner"];
+const PLATFORM_ROLE_LABELS = {
+  member: "普通用户",
+  viewer: "Viewer",
+  operator: "Operator",
+  admin: "Admin",
+  owner: "Owner",
 };
 
 const elements = {
@@ -42,6 +52,9 @@ const elements = {
   createGroupButton: document.querySelector("#createGroupButton"),
   memberRows: document.querySelector("#memberRows"),
   addMemberButton: document.querySelector("#addMemberButton"),
+  platformUserRows: document.querySelector("#platformUserRows"),
+  platformUserEmpty: document.querySelector("#platformUserEmpty"),
+  createPlatformUserButton: document.querySelector("#createPlatformUserButton"),
   extensionRows: document.querySelector("#extensionRows"),
   extensionEmpty: document.querySelector("#extensionEmpty"),
   createExtensionButton: document.querySelector("#createExtensionButton"),
@@ -72,6 +85,8 @@ const elements = {
   environmentClearProxy: document.querySelector("#environmentClearProxy"),
   environmentGeoip: document.querySelector("#environmentGeoip"),
   environmentExtensions: document.querySelector("#environmentExtensions"),
+  environmentAssignmentsField: document.querySelector("#environmentAssignmentsField"),
+  environmentAssignments: document.querySelector("#environmentAssignments"),
   environmentSeed: document.querySelector("#environmentSeed"),
   environmentStartupUrl: document.querySelector("#environmentStartupUrl"),
   environmentTimezone: document.querySelector("#environmentTimezone"),
@@ -112,6 +127,27 @@ const elements = {
   memberEmail: document.querySelector("#memberEmail"),
   memberRole: document.querySelector("#memberRole"),
   memberError: document.querySelector("#memberError"),
+  platformUserDialog: document.querySelector("#platformUserDialog"),
+  platformUserForm: document.querySelector("#platformUserForm"),
+  platformUserName: document.querySelector("#platformUserName"),
+  platformUserEmail: document.querySelector("#platformUserEmail"),
+  platformUserPassword: document.querySelector("#platformUserPassword"),
+  platformUserError: document.querySelector("#platformUserError"),
+  platformPasswordDialog: document.querySelector("#platformPasswordDialog"),
+  platformPasswordForm: document.querySelector("#platformPasswordForm"),
+  platformPasswordTitle: document.querySelector("#platformPasswordTitle"),
+  platformPasswordUserId: document.querySelector("#platformPasswordUserId"),
+  platformPasswordValue: document.querySelector("#platformPasswordValue"),
+  platformPasswordError: document.querySelector("#platformPasswordError"),
+  platformMembershipDialog: document.querySelector("#platformMembershipDialog"),
+  platformMembershipForm: document.querySelector("#platformMembershipForm"),
+  platformMembershipTitle: document.querySelector("#platformMembershipTitle"),
+  platformMembershipUserId: document.querySelector("#platformMembershipUserId"),
+  platformMembershipRows: document.querySelector("#platformMembershipRows"),
+  platformMembershipOrganization: document.querySelector("#platformMembershipOrganization"),
+  platformMembershipRole: document.querySelector("#platformMembershipRole"),
+  platformMembershipError: document.querySelector("#platformMembershipError"),
+  addPlatformMembershipButton: document.querySelector("#addPlatformMembershipButton"),
   organizationDialog: document.querySelector("#organizationDialog"),
   organizationForm: document.querySelector("#organizationForm"),
   organizationName: document.querySelector("#organizationName"),
@@ -241,10 +277,12 @@ function showApplication(session) {
   state.csrf = session.csrf_token;
   elements.authShell.hidden = true;
   elements.appShell.hidden = false;
-  elements.currentUser.textContent = `${session.user.display_name} · ${session.organization.role}`;
+  const accessLabel = session.is_superadmin ? "平台超管" : session.organization.role;
+  elements.currentUser.textContent = `${session.user.display_name} · ${accessLabel}`;
   elements.organizationSelect.replaceChildren(
     ...session.organizations.map((organization) => {
-      const option = new Option(organization.name, organization.id);
+      const suffix = organization.platform_access ? " · 平台访问" : "";
+      const option = new Option(`${organization.name}${suffix}`, organization.id);
       option.selected = organization.id === session.organization.id;
       return option;
     }),
@@ -257,6 +295,8 @@ function showApplication(session) {
   document.querySelector('[data-view="agents"]').hidden = !hasPermission("agents.read");
   document.querySelector('[data-view="tasks"]').hidden = !hasPermission("tasks.read");
   document.querySelector('[data-view="audit"]').hidden = !hasPermission("audit.read");
+  document.querySelector('[data-view="platformUsers"]').hidden = !session.is_superadmin;
+  if (!session.is_superadmin && state.view === "platformUsers") setView("environments");
 }
 
 async function refreshSession() {
@@ -269,7 +309,7 @@ async function loadWorkspace() {
   if (state.workspaceLoading) return;
   state.workspaceLoading = true;
   try {
-    const [groups, environments, members, extensions, agents, leases, tasks, snapshots] = await Promise.all([
+    const [groups, environments, members, extensions, agents, leases, tasks, snapshots, platformUsers] = await Promise.all([
       api("/api/groups"),
       api("/api/environments"),
       api("/api/members"),
@@ -278,6 +318,7 @@ async function loadWorkspace() {
       api("/api/leases"),
       api("/api/tasks"),
       api("/api/snapshots"),
+      state.session.is_superadmin ? api("/api/platform/users") : Promise.resolve({ users: [] }),
     ]);
     state.groups = groups.groups;
     state.environments = environments.environments;
@@ -287,9 +328,11 @@ async function loadWorkspace() {
     state.leases = leases.leases;
     state.tasks = tasks.tasks;
     state.snapshots = snapshots.snapshots;
+    state.platformUsers = platformUsers.users;
     renderGroups();
     renderEnvironments();
     renderMembers();
+    renderPlatformUsers();
     renderExtensions();
     renderAgents();
     renderTasks();
@@ -302,6 +345,7 @@ async function loadWorkspace() {
 function setView(view) {
   if (view === "audit" && !hasPermission("audit.read")) view = "environments";
   if (view === "tasks" && !hasPermission("tasks.read")) view = "environments";
+  if (view === "platformUsers" && !state.session?.is_superadmin) view = "environments";
   state.view = view;
   document.querySelectorAll(".view").forEach((section) => {
     section.hidden = section.id !== `${view}View`;
@@ -357,6 +401,9 @@ function renderEnvironments() {
     const assets = [];
     if (environment.proxy_configured) assets.push(`代理 ${environment.proxy_masked}`);
     if (environment.extension_ids?.length) assets.push(`${environment.extension_ids.length} 个扩展`);
+    if (environment.assigned_users?.length) {
+      assets.push(`分配 ${environment.assigned_users.map((user) => user.display_name).join("、")}`);
+    }
     if (assets.length) primary.append(textElement("span", "environment-assets", assets.join(" · ")));
     nameCell.append(primary);
     const actionCell = document.createElement("td");
@@ -478,8 +525,8 @@ function renderMembers() {
       const select = document.createElement("select");
       select.setAttribute("aria-label", `设置 ${member.user.display_name} 的角色`);
       const roles = currentRole === "owner"
-        ? ["viewer", "operator", "admin", "owner"]
-        : ["viewer", "operator", "admin"];
+        ? ["member", "viewer", "operator", "admin", "owner"]
+        : ["member", "viewer", "operator", "admin"];
       select.replaceChildren(...roles.map((role) => new Option(role, role, false, role === member.role)));
       select.addEventListener("change", () => updateMemberRole(member, select.value));
       roleCell.append(select);
@@ -505,6 +552,70 @@ function renderMembers() {
   elements.memberRows.replaceChildren(...rows);
 }
 
+function renderPlatformUsers() {
+  const rows = state.platformUsers.map((user) => {
+    const row = document.createElement("tr");
+    const identityCell = document.createElement("td");
+    const identity = document.createElement("div");
+    identity.className = "cell-primary";
+    identity.append(
+      textElement("strong", "", user.display_name),
+      textElement("span", "", `${user.email}${user.is_superadmin ? " · 平台超管" : ""}`),
+    );
+    identityCell.append(identity);
+
+    const statusCell = document.createElement("td");
+    statusCell.append(textElement(
+      "span",
+      `status-label status-${user.is_active ? "online" : "revoked"}`,
+      user.is_active ? "已启用" : "已停用",
+    ));
+
+    const organizations = user.memberships.length
+      ? user.memberships.map((membership) => `${membership.organization_name} (${membership.role})`).join("、")
+      : "未分配";
+    const deviceCell = document.createElement("td");
+    const devices = document.createElement("div");
+    devices.className = "cell-primary";
+    devices.append(
+      textElement("strong", "", `${user.active_device_count} 台可用`),
+      textElement("span", "", `累计 ${user.device_count} 台`),
+    );
+    deviceCell.append(devices);
+
+    const actionCell = document.createElement("td");
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+    actions.append(button("团队权限", () => openPlatformMembershipDialog(user)));
+    actions.append(button("重置密码", () => openPlatformPasswordDialog(user)));
+    const statusButton = button(
+      user.is_active ? "停用" : "启用",
+      () => confirmPlatformUserStatus(user),
+      user.is_active ? "danger-text" : "",
+    );
+    if (user.is_active && (user.id === state.session.user.id || user.is_superadmin)) {
+      statusButton.disabled = true;
+      statusButton.title = user.id === state.session.user.id
+        ? "不能停用当前登录账号"
+        : "配置中的平台超管不能停用";
+    }
+    actions.append(statusButton);
+    actionCell.append(actions);
+    row.append(
+      identityCell,
+      statusCell,
+      textElement("td", "", organizations),
+      deviceCell,
+      textElement("td", "", formatTime(user.created_at)),
+      actionCell,
+    );
+    return row;
+  });
+  elements.platformUserRows.replaceChildren(...rows);
+  elements.platformUserEmpty.hidden = rows.length > 0;
+  if (elements.platformMembershipDialog.open) renderPlatformMembershipDialog();
+}
+
 function renderExtensions() {
   const statusLabels = { pending: "等待上传", ready: "可用" };
   const rows = state.extensions.map((extension) => {
@@ -524,6 +635,7 @@ function renderExtensions() {
       `status-label status-${extension.status === "ready" ? "succeeded" : "pending"}`,
       statusLabels[extension.status] || extension.status,
     ));
+
     const actionCell = document.createElement("td");
     const actions = document.createElement("div");
     actions.className = "row-actions";
@@ -570,6 +682,14 @@ function renderAgents() {
       statusLabels[agent.status] || agent.status,
     ));
 
+    const portable = agent.capabilities?.profile_key_portable;
+    const portabilityCell = document.createElement("td");
+    portabilityCell.append(textElement(
+      "span",
+      `status-label status-${portable === true ? "succeeded" : "pending"}`,
+      portable === true ? "可迁移" : portable === false ? "本机绑定" : "未知",
+    ));
+
     const actionCell = document.createElement("td");
     const actions = document.createElement("div");
     actions.className = "row-actions";
@@ -585,6 +705,7 @@ function renderAgents() {
       statusCell,
       hostCell,
       textElement("td", "", agent.version || "-"),
+      portabilityCell,
       textElement("td", "", agent.active_leases),
       textElement("td", "", formatTime(agent.last_seen_at)),
       actionCell,
@@ -686,6 +807,40 @@ function renderEnvironmentExtensions(selectedIds = []) {
 
 function selectedExtensionIds() {
   return [...elements.environmentExtensions.querySelectorAll('input[type="checkbox"]:checked')]
+    .map((input) => input.value);
+}
+
+function renderEnvironmentAssignments(selectedIds = []) {
+  const canManage = hasPermission("assignments.manage");
+  elements.environmentAssignmentsField.hidden = !canManage;
+  if (!canManage) return;
+  const selected = new Set(selectedIds);
+  const members = state.members.filter((member) => member.role === "member");
+  if (members.length === 0) {
+    elements.environmentAssignments.replaceChildren(
+      textElement("p", "extension-picker-empty", "暂无普通用户，请先在团队中添加 member"),
+    );
+    return;
+  }
+  elements.environmentAssignments.replaceChildren(...members.map((member) => {
+    const label = document.createElement("label");
+    label.className = "extension-choice";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = member.id;
+    input.checked = selected.has(member.id);
+    const details = document.createElement("span");
+    details.append(
+      textElement("strong", "", member.user.display_name),
+      textElement("small", "", member.user.email),
+    );
+    label.append(input, details);
+    return label;
+  }));
+}
+
+function selectedAssignmentIds() {
+  return [...elements.environmentAssignments.querySelectorAll('input[type="checkbox"]:checked')]
     .map((input) => input.value);
 }
 
@@ -838,7 +993,7 @@ function openEnvironmentDialog(environment = null) {
   elements.environmentRevision.value = environment?.revision || "";
   elements.environmentName.value = environment?.name || "";
   elements.environmentGroup.replaceChildren(...groupOptions(environment?.group_id || ""));
-  elements.environmentStorage.value = environment?.storage_policy || "local";
+  elements.environmentStorage.value = environment?.storage_policy || "shared";
   updateStoragePolicyNotice();
   elements.environmentTags.value = (environment?.tags || []).join(", ");
   elements.environmentProxy.value = "";
@@ -853,6 +1008,7 @@ function openEnvironmentDialog(environment = null) {
   elements.environmentGeoip.checked = environment?.config?.geoip ?? false;
   updateProxyControls();
   renderEnvironmentExtensions(environment?.extension_ids || []);
+  renderEnvironmentAssignments(environment?.assigned_membership_ids || []);
   elements.environmentSeed.value = environment?.config?.fingerprint_seed || randomSeed();
   elements.environmentStartupUrl.value = environment?.config?.startup_url === "about:blank" ? "" : (environment?.config?.startup_url || "");
   setSelectValue(elements.environmentTimezone, environment?.config?.timezone || "");
@@ -909,6 +1065,9 @@ async function saveEnvironment(event) {
     config,
     extension_ids: selectedExtensionIds(),
   };
+  if (hasPermission("assignments.manage")) {
+    common.assigned_membership_ids = selectedAssignmentIds();
+  }
   const proxy = environmentProxyValue();
   const clearProxy = elements.environmentClearProxy.checked;
   const hasProxy = Boolean(proxy || (existing?.proxy_configured && !clearProxy));
@@ -979,10 +1138,18 @@ function openLaunchDialog(environment) {
     ),
   );
   elements.launchAgent.replaceChildren(
-    ...agents.map((agent) => new Option(
-      `${agent.name}${agent.hostname ? ` · ${agent.hostname}` : ""}`,
-      agent.id,
-    )),
+    ...agents.map((agent) => {
+      let portability = "";
+      if (environment.storage_policy !== "local") {
+        if (agent.capabilities?.profile_key_portable === true) portability = " · 登录态可迁移";
+        else if (agent.capabilities?.profile_key_portable === false) portability = " · 登录态本机绑定";
+        else portability = " · 登录态兼容未知";
+      }
+      return new Option(
+        `${agent.name}${agent.hostname ? ` · ${agent.hostname}` : ""}${portability}`,
+        agent.id,
+      );
+    }),
   );
   const submit = elements.launchForm.querySelector('button[type="submit"]');
   submit.disabled = agents.length === 0;
@@ -1125,6 +1292,193 @@ async function saveMember(event) {
   }
 }
 
+function openPlatformUserDialog() {
+  elements.platformUserForm.reset();
+  setError(elements.platformUserError);
+  elements.platformUserDialog.showModal();
+  elements.platformUserName.focus();
+}
+
+async function savePlatformUser(event) {
+  event.preventDefault();
+  setError(elements.platformUserError);
+  const submit = elements.platformUserForm.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  try {
+    await api("/api/platform/users", {
+      method: "POST",
+      body: {
+        display_name: elements.platformUserName.value,
+        email: elements.platformUserEmail.value,
+        password: elements.platformUserPassword.value,
+      },
+    });
+    elements.platformUserDialog.close();
+    showToast("平台用户已创建");
+    await loadWorkspace();
+  } catch (error) {
+    setError(elements.platformUserError, error.message);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+function openPlatformPasswordDialog(user) {
+  elements.platformPasswordForm.reset();
+  elements.platformPasswordUserId.value = user.id;
+  elements.platformPasswordTitle.textContent = `重置 ${user.display_name} 的密码`;
+  setError(elements.platformPasswordError);
+  elements.platformPasswordDialog.showModal();
+  elements.platformPasswordValue.focus();
+}
+
+async function resetPlatformUserPassword(event) {
+  event.preventDefault();
+  setError(elements.platformPasswordError);
+  const userId = elements.platformPasswordUserId.value;
+  const submit = elements.platformPasswordForm.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  try {
+    await api(`/api/platform/users/${userId}/password`, {
+      method: "PATCH",
+      body: { password: elements.platformPasswordValue.value },
+    });
+    elements.platformPasswordDialog.close();
+    showToast("登录密码已重置");
+    if (userId === state.session.user.id) showAuth();
+    else await loadWorkspace();
+  } catch (error) {
+    setError(elements.platformPasswordError, error.message);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+function openPlatformMembershipDialog(user) {
+  elements.platformMembershipUserId.value = user.id;
+  elements.platformMembershipTitle.textContent = `${user.display_name} 的团队权限`;
+  elements.platformMembershipRole.value = "member";
+  setError(elements.platformMembershipError);
+  renderPlatformMembershipDialog();
+  elements.platformMembershipDialog.showModal();
+}
+
+function renderPlatformMembershipDialog() {
+  const user = state.platformUsers.find(
+    (item) => item.id === elements.platformMembershipUserId.value,
+  );
+  if (!user) {
+    if (elements.platformMembershipDialog.open) elements.platformMembershipDialog.close();
+    return;
+  }
+  const rows = user.memberships.map((membership) => {
+    const row = document.createElement("div");
+    row.className = "platform-membership-row";
+    const identity = document.createElement("div");
+    identity.className = "cell-primary";
+    identity.append(
+      textElement("strong", "", membership.organization_name),
+      textElement("span", "", `加入于 ${formatTime(membership.created_at)}`),
+    );
+    const role = document.createElement("select");
+    role.setAttribute("aria-label", `设置 ${membership.organization_name} 的角色`);
+    role.replaceChildren(...PLATFORM_ROLES.map((value) => new Option(
+      PLATFORM_ROLE_LABELS[value],
+      value,
+      false,
+      value === membership.role,
+    )));
+    role.addEventListener("change", () => updatePlatformMembership(user, membership, role));
+    const remove = button("移除", () => confirmPlatformMembershipRemove(user, membership));
+    if (
+      user.id === state.session.user.id
+      && membership.organization_id === state.session.organization.id
+    ) {
+      remove.disabled = true;
+      remove.title = "不能移除当前账号在活动团队中的权限";
+    }
+    row.append(identity, role, remove);
+    return row;
+  });
+  if (rows.length === 0) {
+    rows.push(textElement("div", "platform-membership-empty", "尚未加入团队"));
+  }
+  elements.platformMembershipRows.replaceChildren(...rows);
+
+  const joinedOrganizationIds = new Set(
+    user.memberships.map((membership) => membership.organization_id),
+  );
+  const availableOrganizations = state.session.organizations.filter(
+    (organization) => !joinedOrganizationIds.has(organization.id),
+  );
+  if (availableOrganizations.length) {
+    elements.platformMembershipOrganization.replaceChildren(
+      ...availableOrganizations.map(
+        (organization) => new Option(organization.name, organization.id),
+      ),
+    );
+    elements.platformMembershipOrganization.disabled = false;
+    elements.addPlatformMembershipButton.disabled = false;
+  } else {
+    elements.platformMembershipOrganization.replaceChildren(
+      new Option("已加入所有团队", ""),
+    );
+    elements.platformMembershipOrganization.disabled = true;
+    elements.addPlatformMembershipButton.disabled = true;
+  }
+}
+
+async function savePlatformMembership(event) {
+  event.preventDefault();
+  setError(elements.platformMembershipError);
+  const userId = elements.platformMembershipUserId.value;
+  elements.addPlatformMembershipButton.disabled = true;
+  try {
+    await api(`/api/platform/users/${userId}/memberships`, {
+      method: "POST",
+      body: {
+        organization_id: elements.platformMembershipOrganization.value,
+        role: elements.platformMembershipRole.value,
+      },
+    });
+    showToast("团队权限已添加");
+    await loadWorkspace();
+  } catch (error) {
+    setError(elements.platformMembershipError, error.message);
+  } finally {
+    if (elements.platformMembershipDialog.open) renderPlatformMembershipDialog();
+  }
+}
+
+async function updatePlatformMembership(user, membership, select) {
+  select.disabled = true;
+  try {
+    await api(`/api/platform/users/${user.id}/memberships/${membership.id}`, {
+      method: "PATCH",
+      body: { role: select.value },
+    });
+    showToast("团队角色已更新");
+    await loadWorkspace();
+  } catch (error) {
+    showToast(error.message, "error");
+    await loadWorkspace();
+  }
+}
+
+function confirmPlatformMembershipRemove(user, membership) {
+  askConfirmation(
+    "移除团队权限",
+    `从“${membership.organization_name}”移除 ${user.display_name}？`,
+    async () => {
+      await api(`/api/platform/users/${user.id}/memberships/${membership.id}`, {
+        method: "DELETE",
+      });
+      showToast("团队权限已移除");
+      await loadWorkspace();
+    },
+  );
+}
+
 function openAgentDialog() {
   elements.agentForm.reset();
   setError(elements.agentError);
@@ -1182,6 +1536,23 @@ function askConfirmation(title, message, action) {
   state.confirmAction = action;
   elements.confirmDialog.returnValue = "cancel";
   elements.confirmDialog.showModal();
+}
+
+function confirmPlatformUserStatus(user) {
+  const enabling = !user.is_active;
+  const action = enabling ? "启用" : "停用";
+  askConfirmation(
+    `${action}平台用户`,
+    `${action} ${user.display_name}（${user.email}）？`,
+    async () => {
+      await api(`/api/platform/users/${user.id}/status`, {
+        method: "PATCH",
+        body: { is_active: enabling },
+      });
+      showToast(`平台用户已${action}`);
+      await loadWorkspace();
+    },
+  );
 }
 
 function confirmEnvironmentDelete(environment) {
@@ -1310,6 +1681,7 @@ elements.environmentGroupFilter.addEventListener("change", renderEnvironments);
 elements.createEnvironmentButton.addEventListener("click", () => openEnvironmentDialog());
 elements.createGroupButton.addEventListener("click", openGroupDialog);
 elements.addMemberButton.addEventListener("click", openMemberDialog);
+elements.createPlatformUserButton.addEventListener("click", openPlatformUserDialog);
 elements.createExtensionButton.addEventListener("click", openExtensionDialog);
 elements.createAgentButton.addEventListener("click", openAgentDialog);
 elements.refreshAuditButton.addEventListener("click", () => loadAudit().catch((error) => showToast(error.message, "error")));
@@ -1358,6 +1730,9 @@ elements.extensionForm.addEventListener("submit", saveExtension);
 elements.launchForm.addEventListener("submit", requestEnvironmentLaunch);
 elements.groupForm.addEventListener("submit", saveGroup);
 elements.memberForm.addEventListener("submit", saveMember);
+elements.platformUserForm.addEventListener("submit", savePlatformUser);
+elements.platformPasswordForm.addEventListener("submit", resetPlatformUserPassword);
+elements.platformMembershipForm.addEventListener("submit", savePlatformMembership);
 elements.agentForm.addEventListener("submit", saveAgent);
 elements.copyAgentTokenButton.addEventListener("click", copyAgentToken);
 elements.agentTokenDialog.addEventListener("close", () => {

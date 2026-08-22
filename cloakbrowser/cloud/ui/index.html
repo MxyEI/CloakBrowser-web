@@ -82,6 +82,7 @@
       <button type="button" data-view="environments" aria-current="page">环境</button>
       <button type="button" data-view="groups">分组</button>
       <button type="button" data-view="members">团队</button>
+      <button type="button" data-view="platformUsers" hidden>平台用户</button>
       <button type="button" data-view="extensions">扩展</button>
       <button type="button" data-view="agents">节点</button>
       <button type="button" data-view="tasks">任务</button>
@@ -138,6 +139,20 @@
         </div>
       </section>
 
+      <section class="view" id="platformUsersView" hidden>
+        <header class="view-header">
+          <div><span class="view-kicker">Platform access</span><h1>平台用户</h1></div>
+          <button class="button primary" id="createPlatformUserButton" type="button">创建用户</button>
+        </header>
+        <div class="table-wrap">
+          <table class="platform-user-table">
+            <thead><tr><th>用户</th><th>状态</th><th>所属团队</th><th>桌面设备</th><th>创建时间</th><th></th></tr></thead>
+            <tbody id="platformUserRows"></tbody>
+          </table>
+          <div class="empty-state" id="platformUserEmpty" hidden>暂无平台用户</div>
+        </div>
+      </section>
+
       <section class="view" id="extensionsView" hidden>
         <header class="view-header">
           <div><span class="view-kicker">Managed packages</span><h1>扩展程序</h1></div>
@@ -159,7 +174,7 @@
         </header>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>节点</th><th>状态</th><th>主机</th><th>版本</th><th>租约</th><th>最后心跳</th><th></th></tr></thead>
+            <thead><tr><th>节点</th><th>状态</th><th>主机</th><th>版本</th><th>登录态</th><th>租约</th><th>最后心跳</th><th></th></tr></thead>
             <tbody id="agentRows"></tbody>
           </table>
           <div class="empty-state" id="agentEmpty" hidden>暂无执行节点</div>
@@ -218,6 +233,10 @@
           <div class="form-grid">
             <label class="field field-wide"><span>存储策略</span><select id="environmentStorage"><option value="local">仅本地</option><option value="backup">加密云端备份</option><option value="shared">团队共享</option></select></label>
             <p class="form-notice field-wide" id="storagePolicyNotice" hidden>浏览器关闭后将加密上传最新数据；下次启动会先恢复云端版本。上传失败时节点本地数据仍会保留。</p>
+            <fieldset class="extension-picker field-wide" id="environmentAssignmentsField">
+              <legend>分配平台用户</legend>
+              <div id="environmentAssignments"></div>
+            </fieldset>
             <fieldset class="extension-picker field-wide">
               <legend>扩展程序</legend>
               <div id="environmentExtensions"></div>
@@ -317,10 +336,51 @@
       <header class="dialog-header"><div><span>Member</span><h2>添加团队成员</h2></div><button class="icon-button" type="button" data-close-dialog="memberDialog" aria-label="关闭">×</button></header>
       <div class="dialog-body">
         <label class="field"><span>注册邮箱</span><input id="memberEmail" type="email" maxlength="254" required></label>
-        <label class="field"><span>角色</span><select id="memberRole"><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option><option value="owner">Owner</option></select></label>
+        <label class="field"><span>角色</span><select id="memberRole"><option value="member">普通用户</option><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option><option value="owner">Owner</option></select></label>
         <p class="form-error" id="memberError" role="alert" hidden></p>
       </div>
       <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="memberDialog">取消</button><button class="button primary" type="submit">添加成员</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="platformUserDialog">
+    <form id="platformUserForm" method="dialog">
+      <header class="dialog-header"><div><span>Platform user</span><h2>创建平台用户</h2></div><button class="icon-button" type="button" data-close-dialog="platformUserDialog" aria-label="关闭">×</button></header>
+      <div class="dialog-body">
+        <label class="field"><span>显示名称</span><input id="platformUserName" maxlength="80" required autocomplete="off"></label>
+        <label class="field"><span>登录邮箱</span><input id="platformUserEmail" type="email" maxlength="254" required autocomplete="off"></label>
+        <label class="field"><span>初始密码</span><input id="platformUserPassword" type="password" minlength="10" maxlength="128" required autocomplete="new-password"></label>
+        <p class="form-error" id="platformUserError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="platformUserDialog">取消</button><button class="button primary" type="submit">创建用户</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="platformPasswordDialog">
+    <form id="platformPasswordForm" method="dialog">
+      <header class="dialog-header"><div><span>Credential</span><h2 id="platformPasswordTitle">重置登录密码</h2></div><button class="icon-button" type="button" data-close-dialog="platformPasswordDialog" aria-label="关闭">×</button></header>
+      <input id="platformPasswordUserId" type="hidden">
+      <div class="dialog-body">
+        <label class="field"><span>新密码</span><input id="platformPasswordValue" type="password" minlength="10" maxlength="128" required autocomplete="new-password"></label>
+        <p class="form-error" id="platformPasswordError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="platformPasswordDialog">取消</button><button class="button primary" type="submit">重置密码</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="platformMembershipDialog">
+    <form id="platformMembershipForm" method="dialog">
+      <header class="dialog-header"><div><span>Team access</span><h2 id="platformMembershipTitle">管理团队权限</h2></div><button class="icon-button" type="button" data-close-dialog="platformMembershipDialog" aria-label="关闭">×</button></header>
+      <input id="platformMembershipUserId" type="hidden">
+      <div class="dialog-body">
+        <div class="platform-membership-list" id="platformMembershipRows"></div>
+        <div class="form-grid platform-membership-add">
+          <label class="field"><span>加入团队</span><select id="platformMembershipOrganization" required></select></label>
+          <label class="field"><span>角色</span><select id="platformMembershipRole"><option value="member">普通用户</option><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="admin">Admin</option><option value="owner">Owner</option></select></label>
+        </div>
+        <p class="form-error" id="platformMembershipError" role="alert" hidden></p>
+      </div>
+      <footer class="dialog-footer"><button class="button secondary" type="button" data-close-dialog="platformMembershipDialog">关闭</button><button class="button primary" id="addPlatformMembershipButton" type="submit">加入团队</button></footer>
     </form>
   </dialog>
 

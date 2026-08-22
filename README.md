@@ -190,9 +190,17 @@ console shows pending, running, successful, and failed task states.
 
 Roles are enforced by the API, not only by the interface: Owners control the
 organization, Admins manage members/groups/environments/Agents, Operators can
-create and edit environments, and Viewers have read-only access. Every environment
+create and edit environments, Viewers have organization-wide read-only access,
+and Members can only read and launch environments explicitly assigned to them. Every environment
 update carries an expected revision, so one team member cannot silently
 overwrite another member's newer edit.
+
+Owners and Admins can select one or more Member accounts in the environment
+editor. Assigned environments must use `backup` or `shared` storage, so their
+closed browser data is uploaded instead of remaining on one machine. Environment
+configuration, snapshots, runtime proxy secrets, extensions, leases, and task
+history all apply the same assignment check; hiding an environment in the UI is
+not treated as an authorization boundary.
 
 Owners and Admins can register an execution node from the Nodes view. The raw
 Agent token is returned once and only its SHA-256-derived digest is stored by the
@@ -214,6 +222,64 @@ a monotonically increasing fencing token, so an expired process cannot overwrite
 a newer owner. The CLI refuses non-loopback plain HTTP URLs so Agent credentials
 cannot be sent to a remote server without TLS.
 
+An assigned Member runs a user-bound desktop node without receiving an
+organization-wide Agent token:
+
+```bash
+cloakbrowser workspace --cloud-url https://cloud.example.com --email member@example.com
+```
+
+The command opens a loopback Workspace UI, signs in through its local Python
+service, and registers the current device. Members can start and stop assigned
+environments or create their own cloud-backed environment with a fingerprint and
+proxy. A self-created environment is always assigned to that Member in the
+device's organization; the server accepts only `backup` or `shared` storage and
+does not accept group, extension, or arbitrary membership IDs from the desktop
+client. Closing its browser uploads the complete encrypted profile through the
+same snapshot pipeline as an administrator-created environment.
+
+The local page never receives the returned `cb_device_` credential, snapshot
+key, or unmasked cloud proxy. Password and new-proxy forms post directly to the
+loopback Python service instead of being read by the Workspace JavaScript. Only
+a random device UUID is stored under `~/.cloakbrowser/cloud-workspace` with
+owner-only permissions. A new login rotates the previous device credential.
+Plain HTTP is accepted only for loopback development URLs. Use `--cli` for the
+terminal `launch`, `stop`, and `list` fallback, or `--once` to sign in, list, and
+exit.
+
+Platform operators can grant cross-organization superadmin access with a
+deployment-controlled email allowlist. A matching active account can discover
+and switch into every organization with effective Owner permissions without
+being inserted as a team member. Platform access and every resulting mutation
+are recorded in the target organization's audit log. Keep this allowlist in the
+deployment secret/configuration boundary and use dedicated administrator
+accounts rather than ordinary Member accounts. Because self-registration is
+open in the preview implementation, allowlisted addresses cannot register while
+the allowlist is enabled. Bootstrap the first dedicated account while the
+service is bound to loopback with the allowlist unset, stop it, then enable the
+allowlist before exposing the deployment. After that, the superadmin-only
+Platform Users view can provision additional accounts, including other
+allowlisted administrators, without public self-registration.
+
+Platform-created users start without a personal organization. A superadmin can
+open Team Access from the Platform Users view to add the account to any team,
+change its role, or remove its team access without switching organizations. Use
+the `member` role for desktop access, then assign cloud-backed environments to
+that membership from the environment editor. Platform superadmins can also
+deactivate/reactivate users and reset initial or forgotten passwords.
+Deactivation and password reset are rejected while any of the user's desktop
+devices holds an active environment lease. Once accepted, all browser sessions
+are deleted, all user-bound desktop credentials are revoked, and unfinished
+desktop tasks are failed. Reactivation does not restore an old credential; the
+user must log in again locally.
+
+Changing a user away from `member`, or removing that membership, follows the
+same fail-closed lease rule. After the user's running environment has stopped,
+the operation revokes that team's desktop devices and removes the user's
+environment assignments. Changing the role back to `member` does not restore
+old assignments or device credentials. Every cross-team membership change is
+written to the affected team's audit log.
+
 The `backup` and `shared` storage policies synchronize the complete browser
 user-data directory after Chromium has closed and restore the latest snapshot
 before Chromium starts on another Agent. Snapshot payloads use a separate
@@ -224,6 +290,25 @@ Version checks and lease fencing prevent an expired Agent from overwriting newer
 state. If an upload fails, the Agent records the local copy as unsynchronized and
 retries it before the next launch. If both that local copy and the cloud version
 changed, launch stops with a conflict instead of discarding either copy.
+
+The snapshot contains Chromium's `Cookies`, `Login Data`, `Local State`, and
+other profile files. Cloud-backed profiles explicitly use Chromium's mock
+keychain on macOS and basic password store on Linux, and record that backend in
+the encrypted snapshot. This makes login databases portable between Agents on
+the same operating-system family without exporting a host Keychain or Secret
+Service entry. Restores are validated before replacing local data, and a snapshot
+from an incompatible platform is rejected rather than opened with missing login
+state. Because these portable Chromium backends are not an OS key store, local
+profile protection depends on the Agent directory's owner-only permissions and
+host disk security; the cloud copy remains protected by its per-environment
+AES-256-GCM key.
+
+Windows Chromium continues to use DPAPI. Its snapshot metadata is bound to the
+creating Agent, so another Windows Agent rejects it instead of silently losing
+cookies or saved logins. A future custom Chromium profile-key implementation is
+still required for Windows-to-Windows portability. Snapshots created before
+profile-key metadata was introduced must be opened and closed once on their
+original Agent before moving them to another device.
 
 The default limit is 1 GiB per encrypted snapshot and 100 GiB of current
 snapshots per organization. Configure them with
@@ -247,12 +332,14 @@ Extension packages default to 100 MiB each and 5 GiB per organization. Configure
 those limits with `CLOAKBROWSER_CLOUD_MAX_EXTENSION_MB` and
 `CLOAKBROWSER_CLOUD_ORG_EXTENSION_QUOTA_MB`.
 
-For a PostgreSQL deployment behind HTTPS, configure at least:
+After bootstrapping the platform account, a PostgreSQL deployment behind HTTPS
+must configure at least:
 
 ```bash
 export CLOAKBROWSER_CLOUD_DATABASE_URL='postgresql+psycopg://user:pass@db/cloak'
 export CLOAKBROWSER_CLOUD_SECRET='replace-with-at-least-32-random-bytes'
 export CLOAKBROWSER_CLOUD_COOKIE_SECURE=true
+export CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS='root@example.com'
 cloakbrowser cloud --host 0.0.0.0 --no-open
 ```
 

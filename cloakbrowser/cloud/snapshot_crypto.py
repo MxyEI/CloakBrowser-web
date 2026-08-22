@@ -11,7 +11,7 @@ import shutil
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Callable, Optional
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -304,6 +304,7 @@ def restore_encrypted_snapshot(
     version: int,
     *,
     max_unpacked_bytes: int,
+    validate_restored: Optional[Callable[[Path], None]] = None,
 ) -> None:
     parent = browser_data_dir.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -319,6 +320,8 @@ def restore_encrypted_snapshot(
             snapshot_aad(environment_id, version),
         )
         _extract_archive(archive_path, restore_path, max_unpacked_bytes)
+        if validate_restored is not None:
+            validate_restored(restore_path)
         if browser_data_dir.exists():
             browser_data_dir.rename(backup_path)
         try:

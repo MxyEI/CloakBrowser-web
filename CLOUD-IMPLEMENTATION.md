@@ -1,9 +1,10 @@
 # Cloud Team Console Implementation Record
 
-Date: 2026-08-02
+Date: 2026-08-22
 
 Status: preview implementation complete through encrypted profile sync, runtime
-secret delivery, and managed extension distribution.
+secret delivery, managed extension distribution, member assignments, and
+user-bound desktop workspaces, including platform-level administration.
 
 ## Scope
 
@@ -39,6 +40,28 @@ CloakBrowser binary and the selected environment configuration.
 - API permissions are enforced server-side, including tenant isolation.
 - Added team-member role changes, removal rules, and last-owner protection.
 - Added organization-scoped audit logs.
+- Added a Member role whose environment, Agent, task, lease, extension, and
+  snapshot visibility is restricted to explicit environment assignments.
+- Added a deployment-configured platform superadmin allowlist. Matching active
+  accounts can discover and switch into every organization with effective Owner
+  permissions without receiving hidden membership rows. Cross-organization
+  access and subsequent mutations retain the real user ID and an explicit
+  platform-superadmin audit marker. Allowlisted addresses are blocked from
+  self-registration. The first administrator is bootstrapped on a controlled
+  loopback instance; after that, a superadmin-only platform user directory can
+  create accounts without personal organizations, including additional
+  allowlisted administrators.
+- Added platform user activation and password reset controls. Both operations
+  preserve memberships and environment assignments. Deactivation and password
+  reset fail while a user-bound desktop Agent has an active lease; otherwise
+  they revoke every web session and desktop credential and fail unfinished
+  desktop tasks. Reactivation never restores a revoked device credential.
+- Added cross-team membership management to the platform user directory.
+  Superadmins can join a user to any organization, change the role, or remove
+  access without switching organizations. Member-role exit and removal reuse
+  active-lease blocking, desktop Agent revocation, unfinished-task failure, and
+  environment unassignment rules. Last-owner protection still applies, and
+  audits are written to the affected organization.
 
 ### Environment and group management
 
@@ -52,6 +75,8 @@ CloakBrowser binary and the selected environment configuration.
   environment has an active lease.
 - Local Manager fingerprint configuration continues to report incomplete GPU
   pairs and obvious host/platform conflicts before save or launch.
+- Owners and Admins can assign cloud-backed environments to one or more Member
+  accounts. Assigned environments cannot switch to local-only storage.
 
 ### Remote execution
 
@@ -63,6 +88,20 @@ CloakBrowser binary and the selected environment configuration.
 - Added task history and failure reporting.
 - Launch selection checks `browser_launch`, `snapshot_sync`, `secret_sync`, and
   `extension_sync` against the selected environment.
+- Added password-authenticated desktop device enrollment with rotating,
+  digest-only `cb_device_` credentials. Device credentials are bound to one user
+  and can only list, lease, download, launch, and upload assigned environments.
+- Added `cloakbrowser workspace` for signing in locally and running the existing
+  snapshot-aware Agent runtime without distributing an organization Agent token.
+- The Workspace command now opens a loopback desktop UI by default while keeping
+  `--cli` as a diagnostic fallback. Its Python service owns the device token,
+  runtime proxy, snapshot key, and Agent runtime; browser JavaScript receives
+  only masked environment data and structured lifecycle states.
+- Member devices can create their own `backup` or `shared` environments. The
+  server forces the device organization and current Member assignment, rejects
+  local storage and arbitrary assignment/group/extension fields, encrypts any
+  proxy, and audits the real Member actor. First browser close uploads snapshot
+  version 1 through the normal encrypted profile pipeline.
 
 ### Browser data storage and synchronization
 
@@ -79,6 +118,14 @@ CloakBrowser binary and the selected environment configuration.
 - If local dirty data and the cloud snapshot both changed, launch stops with a
   conflict instead of choosing one copy automatically.
 - Added safe archive creation/extraction and snapshot size/organization quotas.
+- Cloud-backed macOS profiles explicitly use Chromium's mock keychain and Linux
+  profiles use the basic password store. The chosen backend is recorded inside
+  the encrypted snapshot and validated before a restored directory replaces
+  local data.
+- Cross-platform profile restores fail closed. Windows DPAPI snapshots are tied
+  to their creating Agent until the binary supports a portable profile key.
+- Legacy snapshots without profile-key metadata must be opened and closed once
+  on their original Agent before cross-device restore.
 
 ### Proxy secrets
 
@@ -148,11 +195,29 @@ CloakBrowser binary and the selected environment configuration.
 ## Security Invariants
 
 - Every user-facing resource lookup is organization-scoped.
+- Platform superadmin access is derived from the normalized deployment email
+  allowlist on every request. After a configuration reload or process restart,
+  removing an address removes elevated access from existing sessions on their
+  next request.
+- An address already present in the superadmin allowlist cannot be claimed by
+  the open self-registration endpoint.
+- Platform user listing, creation, activation, deactivation, and password reset
+  require a superadmin session and a valid CSRF token for mutations. Lifecycle
+  changes are audited in the administrator's selected organization with the
+  real actor ID and platform-superadmin marker.
+- Cross-team membership mutations require the same platform authorization but
+  write their audit record to the target organization. Changing back to Member
+  never revives a previously revoked desktop credential or removed assignment.
+- A configured superadmin cannot be deactivated, and a superadmin cannot
+  deactivate the account backing the current session.
 - Browser mutations require a matching CSRF token.
 - Public binds require a configured application secret, secure cookies, and an
   HTTPS reverse proxy.
 - Agent tokens, task tokens, and lease tokens have separate purposes and
   lifetimes.
+- Desktop self-create requests require a current Member-bound device credential;
+  managed Agent tokens cannot create environments, and ownership is never taken
+  from request-supplied identifiers.
 - A lease from one organization or environment cannot read another environment's
   snapshots, secrets, or extensions.
 - A task payload is safe to persist and inspect; runtime secrets are fetched only
@@ -161,6 +226,8 @@ CloakBrowser binary and the selected environment configuration.
 - Revision conflicts and snapshot conflicts fail closed.
 - Extension and snapshot archives are validated before extraction, and extraction
   never trusts archive paths.
+- Profile-key metadata must match the current Agent before restored browser data
+  can replace the local profile directory.
 - The master key must be backed up separately. Losing it makes wrapped snapshot
   keys and proxy secrets unrecoverable.
 
@@ -169,6 +236,7 @@ CloakBrowser binary and the selected environment configuration.
 - `CLOAKBROWSER_CLOUD_DATABASE_URL`
 - `CLOAKBROWSER_CLOUD_SECRET`
 - `CLOAKBROWSER_CLOUD_COOKIE_SECURE`
+- `CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS` (comma-separated platform account emails)
 - `CLOAKBROWSER_CLOUD_SNAPSHOT_KEY`
 - `CLOAKBROWSER_CLOUD_MAX_SNAPSHOT_MB` (default 1024 MiB)
 - `CLOAKBROWSER_CLOUD_ORG_SNAPSHOT_QUOTA_MB` (default 102400 MiB)
@@ -189,20 +257,25 @@ CloakBrowser binary and the selected environment configuration.
 - `cloakbrowser/cloud/extension_packages.py`: extension validation/extraction
 - `cloakbrowser/cloud/agent_runtime.py`: task, lease, snapshot, secret, and
   extension execution logic
+- `cloakbrowser/cloud/workspace_app.py` and `workspace_ui/`: loopback Member
+  desktop client, credential boundary, cloud self-create, and lifecycle UI
 - `cloakbrowser/cloud/ui/`: team console frontend
 - `tests/test_cloud.py`: security, concurrency, storage, runtime, and UI coverage
 
 ## Verification Record
 
-- Cloud-focused suite: 36 passed.
-- Full non-slow repository suite: 751 passed, 1 skipped, 40 deselected.
+- Cloud-focused suite: 49 passed.
+- Full non-slow repository suite: 862 passed, 40 deselected.
 - Python compile, JavaScript syntax, and `git diff --check` passed.
-- Desktop and 390 px Playwright checks passed without page errors or body
-  overflow.
+- Cloud-console desktop and 390 px Playwright checks passed without page errors
+  or body overflow. A new Workspace screenshot run was unavailable because the
+  in-app browser had no active browser instance.
 - Real HTTP QA covered login, extension upload, proxy/extension environment
   creation, deliberate Revision conflict, Agent heartbeat, task claim, lease
   acquisition, runtime-asset fetch, safe extension unpack, launcher options,
-  stop, and cleanup.
+  stop, and cleanup. Workspace QA additionally covered Member login, cloud
+  self-create, masked local state, real browser start/stop, and first-close
+  encrypted snapshot version 1.
 - QA scans found no proxy username or password in the cloud database, snapshot,
   or object directories.
 
@@ -224,6 +297,9 @@ CloakBrowser binary and the selected environment configuration.
   exit-IP locking, temporary browser fingerprint previews, and runtime
   fingerprint details. The control plane cannot report these accurately without
   executing them on the selected Agent.
+- Add a custom per-environment Chromium profile key or DPAPI rewrapping layer for
+  Windows-to-Windows portability. Current Windows snapshots deliberately remain
+  bound to their creating Agent.
 - Add pagination/filtering before organizations accumulate large task and audit
   histories.
 - Decide whether revoked Agent records need an administrative archive/purge

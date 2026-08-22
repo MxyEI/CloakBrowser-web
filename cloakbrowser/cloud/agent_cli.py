@@ -111,6 +111,7 @@ def heartbeat_payload() -> dict[str, Any]:
             "leases": True,
             "browser_launch": True,
             "snapshot_sync": True,
+            "profile_key_portable": platform.system() in {"Darwin", "Linux"},
             "secret_sync": True,
             "extension_sync": True,
         },

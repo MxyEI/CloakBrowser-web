@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import get_cache_dir
+from .security import normalize_email
 
 
 PUBLIC_HOSTS = {"0.0.0.0", "::"}
@@ -99,6 +100,7 @@ class CloudSettings:
     extension_dir: Optional[Path] = None
     max_extension_bytes: int = DEFAULT_MAX_EXTENSION_BYTES
     max_organization_extension_bytes: int = DEFAULT_MAX_ORGANIZATION_EXTENSION_BYTES
+    superadmin_emails: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(cls, data_dir: Optional[str] = None) -> "CloudSettings":
@@ -116,6 +118,20 @@ class CloudSettings:
         configured_secret = os.environ.get("CLOAKBROWSER_CLOUD_SECRET", "").strip()
         development_secret = not bool(configured_secret)
         secret_key = configured_secret or secrets.token_urlsafe(48)
+        raw_superadmin_emails = os.environ.get(
+            "CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS", ""
+        )
+        try:
+            superadmin_emails = frozenset(
+                normalize_email(value)
+                for value in raw_superadmin_emails.split(",")
+                if value.strip()
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS must contain "
+                "comma-separated valid email addresses"
+            ) from exc
         secure = os.environ.get("CLOAKBROWSER_CLOUD_COOKIE_SECURE", "").strip().lower()
         cookie_secure = secure in {"1", "true", "yes", "on"}
         raw_max_snapshot_mb = os.environ.get(
@@ -173,6 +189,7 @@ class CloudSettings:
             extension_dir=root / "extensions",
             max_extension_bytes=max_extension_mb * 1024 * 1024,
             max_organization_extension_bytes=extension_quota_mb * 1024 * 1024,
+            superadmin_emails=superadmin_emails,
         )
 
     def validate_bind(self, host: str) -> None:

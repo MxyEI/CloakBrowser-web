@@ -66,6 +66,20 @@ def normalize_extension_ids(values: List[str]) -> List[str]:
     return result
 
 
+def normalize_uuid_ids(values: List[str], field_name: str) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for raw in values:
+        try:
+            value = str(uuid.UUID(raw))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} contains an invalid id") from exc
+        if value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -98,12 +112,85 @@ class LoginRequest(StrictModel):
             raise ValueError(str(exc)) from exc
 
 
+class ClientLoginRequest(LoginRequest):
+    organization_id: Optional[str] = Field(default=None, min_length=36, max_length=36)
+    device_uid: str = Field(min_length=36, max_length=36)
+    device_name: str = Field(min_length=1, max_length=100)
+    hostname: str = Field(default="", max_length=255)
+    platform: str = Field(default="", max_length=120)
+    version: str = Field(default="", max_length=40)
+    capabilities: Dict[str, bool] = Field(default_factory=dict, max_length=30)
+
+    @field_validator("organization_id", "device_uid")
+    @classmethod
+    def validate_uuid(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as exc:
+            raise ValueError("value must be a UUID") from exc
+
+
 class OrganizationCreate(StrictModel):
     name: str = Field(min_length=1, max_length=100)
 
 
 class OrganizationSwitch(StrictModel):
     organization_id: str = Field(min_length=36, max_length=36)
+
+
+class PlatformUserCreate(StrictModel):
+    email: str
+    password: str = Field(min_length=10, max_length=128)
+    display_name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        try:
+            return normalize_email(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class PlatformUserStatusUpdate(StrictModel):
+    is_active: bool
+
+
+class PlatformUserPasswordReset(StrictModel):
+    password: str = Field(min_length=10, max_length=128)
+
+
+class PlatformMembershipCreate(StrictModel):
+    organization_id: str = Field(min_length=36, max_length=36)
+    role: str = "member"
+
+    @field_validator("organization_id")
+    @classmethod
+    def validate_organization_id(cls, value: str) -> str:
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as exc:
+            raise ValueError("organization_id must be a UUID") from exc
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        if value not in ROLES:
+            raise ValueError("role must be owner, admin, operator, viewer, or member")
+        return value
+
+
+class PlatformMembershipUpdate(StrictModel):
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        if value not in ROLES:
+            raise ValueError("role must be owner, admin, operator, viewer, or member")
+        return value
 
 
 class MemberCreate(StrictModel):
@@ -122,7 +209,7 @@ class MemberCreate(StrictModel):
     @classmethod
     def validate_role(cls, value: str) -> str:
         if value not in ROLES:
-            raise ValueError("role must be owner, admin, operator, or viewer")
+            raise ValueError("role must be owner, admin, operator, viewer, or member")
         return value
 
 
@@ -133,7 +220,7 @@ class MemberUpdate(StrictModel):
     @classmethod
     def validate_role(cls, value: str) -> str:
         if value not in ROLES:
-            raise ValueError("role must be owner, admin, operator, or viewer")
+            raise ValueError("role must be owner, admin, operator, viewer, or member")
         return value
 
 
@@ -241,6 +328,7 @@ class EnvironmentCreate(StrictModel):
     config: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     proxy: str = Field(default="", max_length=2048)
     extension_ids: List[str] = Field(default_factory=list, max_length=20)
+    assigned_membership_ids: List[str] = Field(default_factory=list, max_length=100)
 
     @field_validator("tags")
     @classmethod
@@ -267,6 +355,31 @@ class EnvironmentCreate(StrictModel):
     def validate_extension_ids(cls, values: List[str]) -> List[str]:
         return normalize_extension_ids(values)
 
+    @field_validator("assigned_membership_ids")
+    @classmethod
+    def validate_assigned_membership_ids(cls, values: List[str]) -> List[str]:
+        return normalize_uuid_ids(values, "assigned_membership_ids")
+
+
+class DeviceEnvironmentCreate(StrictModel):
+    """Fields a desktop member may set when creating their own environment."""
+
+    name: str = Field(min_length=1, max_length=100)
+    tags: List[str] = Field(default_factory=list, max_length=20)
+    storage_policy: Literal["backup", "shared"] = "shared"
+    config: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
+    proxy: str = Field(default="", max_length=2048)
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_tags(cls, values: List[str]) -> List[str]:
+        return EnvironmentCreate.normalize_tags(values)
+
+    @field_validator("proxy")
+    @classmethod
+    def validate_proxy(cls, value: str) -> str:
+        return normalize_proxy(value)
+
 
 class EnvironmentUpdate(StrictModel):
     expected_revision: int = Field(ge=1)
@@ -279,6 +392,7 @@ class EnvironmentUpdate(StrictModel):
     proxy: Optional[str] = Field(default=None, max_length=2048)
     clear_proxy: bool = False
     extension_ids: Optional[List[str]] = Field(default=None, max_length=20)
+    assigned_membership_ids: Optional[List[str]] = Field(default=None, max_length=100)
 
     @field_validator("tags")
     @classmethod
@@ -296,6 +410,17 @@ class EnvironmentUpdate(StrictModel):
     @classmethod
     def validate_extension_ids(cls, values: Optional[List[str]]) -> Optional[List[str]]:
         return None if values is None else normalize_extension_ids(values)
+
+    @field_validator("assigned_membership_ids")
+    @classmethod
+    def validate_assigned_membership_ids(
+        cls, values: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        return (
+            None
+            if values is None
+            else normalize_uuid_ids(values, "assigned_membership_ids")
+        )
 
     @model_validator(mode="after")
     def validate_secret_update(self) -> "EnvironmentUpdate":
@@ -349,6 +474,10 @@ class AgentLeaseProof(StrictModel):
 
 class RemoteLaunchRequest(StrictModel):
     agent_id: str = Field(min_length=36, max_length=36)
+    expected_revision: int = Field(ge=1)
+
+
+class AgentSelfLaunchRequest(StrictModel):
     expected_revision: int = Field(ge=1)
 
 

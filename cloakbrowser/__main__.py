@@ -621,10 +621,12 @@ def main() -> None:
     from .profile_manager import add_manager_parser, cmd_manager
     from .cloud.agent_cli import add_agent_parser, cmd_agent
     from .cloud.cli import add_cloud_parser, cmd_cloud
+    from .cloud.workspace_cli import add_workspace_parser, cmd_workspace
 
     add_manager_parser(sub)
     add_cloud_parser(sub)
     add_agent_parser(sub)
+    add_workspace_parser(sub)
 
     login_p = sub.add_parser(
         "login", help="Save a license key (or get a free key via GitHub)"
@@ -650,6 +652,7 @@ def main() -> None:
         "manager": cmd_manager,
         "cloud": cmd_cloud,
         "agent": cmd_agent,
+        "workspace": cmd_workspace,
         "login": cmd_login,
         "logout": cmd_logout,
     }

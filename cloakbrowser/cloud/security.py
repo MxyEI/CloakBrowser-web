@@ -10,7 +10,12 @@ import secrets
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
-from .constants import AGENT_TOKEN_PREFIX, LEASE_TOKEN_PREFIX, TASK_TOKEN_PREFIX
+from .constants import (
+    AGENT_TOKEN_PREFIX,
+    DEVICE_TOKEN_PREFIX,
+    LEASE_TOKEN_PREFIX,
+    TASK_TOKEN_PREFIX,
+)
 
 SESSION_COOKIE = "cloak_cloud_session"
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -55,6 +60,14 @@ def new_agent_token() -> str:
 
 def agent_token_digest(token: str) -> str:
     return hashlib.sha256(f"agent:{token}".encode("utf-8")).hexdigest()
+
+
+def new_device_token() -> str:
+    return f"{DEVICE_TOKEN_PREFIX}{secrets.token_urlsafe(48)}"
+
+
+def device_token_digest(token: str) -> str:
+    return hashlib.sha256(f"device:{token}".encode("utf-8")).hexdigest()
 
 
 def new_lease_token() -> str:

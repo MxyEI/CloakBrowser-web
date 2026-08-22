@@ -76,6 +76,9 @@ class Membership(Base):
 
     organization: Mapped[Organization] = relationship(back_populates="memberships")
     user: Mapped[User] = relationship(back_populates="memberships")
+    environment_assignments: Mapped[List["EnvironmentAssignment"]] = relationship(
+        back_populates="membership", cascade="all, delete-orphan"
+    )
 
 
 class Session(Base):
@@ -146,6 +149,33 @@ class Environment(Base):
         cascade="all, delete-orphan",
         order_by="EnvironmentExtension.position",
     )
+    assignments: Mapped[List["EnvironmentAssignment"]] = relationship(
+        back_populates="environment",
+        cascade="all, delete-orphan",
+        order_by="EnvironmentAssignment.assigned_at",
+    )
+
+
+class EnvironmentAssignment(Base):
+    __tablename__ = "environment_assignments"
+    __table_args__ = (
+        Index("ix_environment_assignments_membership", "membership_id"),
+    )
+
+    environment_id: Mapped[str] = mapped_column(
+        ForeignKey("cloud_environments.id", ondelete="CASCADE"), primary_key=True
+    )
+    membership_id: Mapped[str] = mapped_column(
+        ForeignKey("memberships.id", ondelete="CASCADE"), primary_key=True
+    )
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    assigned_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    environment: Mapped[Environment] = relationship(back_populates="assignments")
+    membership: Mapped[Membership] = relationship(back_populates="environment_assignments")
 
 
 class EnvironmentSecret(Base):
@@ -251,6 +281,42 @@ class AgentNode(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    client_device: Mapped[Optional["ClientDevice"]] = relationship(
+        back_populates="agent",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class ClientDevice(Base):
+    __tablename__ = "client_devices"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "user_id", "device_uid"),
+        Index("ix_client_devices_membership", "membership_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    membership_id: Mapped[str] = mapped_column(
+        ForeignKey("memberships.id", ondelete="CASCADE"), index=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_nodes.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    device_uid: Mapped[str] = mapped_column(String(64))
+    token_digest: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    last_login_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    agent: Mapped[AgentNode] = relationship(back_populates="client_device")
+    membership: Mapped[Membership] = relationship()
+    user: Mapped[User] = relationship()
 
 
 class EnvironmentLease(Base):

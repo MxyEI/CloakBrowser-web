@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>CloakBrowser Workspace</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <main>
+    <section id="loginShell" class="login-shell" hidden>
+      <div class="login-brand">
+        <span class="brand-mark">CB</span>
+        <div>
+          <h1>CloakBrowser</h1>
+          <p>Workspace</p>
+        </div>
+      </div>
+      <form class="login-form" method="post" action="/api/login" autocomplete="on">
+        <input class="csrf-field" type="hidden" name="csrf_token">
+        <h2>Sign in</h2>
+        <label>
+          <span>Email</span>
+          <input id="loginEmail" name="email" type="email" autocomplete="username" required>
+        </label>
+        <label>
+          <span>Password</span>
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <label>
+          <span>Team ID</span>
+          <input id="loginOrganization" name="organization_id" autocomplete="off" placeholder="Optional">
+        </label>
+        <button class="primary wide" type="submit">Sign in</button>
+        <p id="loginCloud" class="endpoint"></p>
+        <p id="loginError" class="form-error" hidden></p>
+      </form>
+    </section>
+
+    <section id="appShell" class="app-shell" hidden>
+      <header class="topbar">
+        <div class="product">
+          <span class="brand-mark small">CB</span>
+          <div>
+            <strong>CloakBrowser Workspace</strong>
+            <span id="organizationName"></span>
+          </div>
+        </div>
+        <div class="account">
+          <div class="account-copy">
+            <strong id="userName"></strong>
+            <span id="connectionState"></span>
+          </div>
+          <button id="logoutButton" class="quiet" type="button">Sign out</button>
+        </div>
+      </header>
+
+      <section class="workspace-band">
+        <div class="workspace-heading">
+          <div>
+            <h1>Environments</h1>
+            <p id="environmentSummary"></p>
+          </div>
+          <div class="heading-actions">
+            <button id="refreshButton" class="quiet" type="button">Refresh</button>
+            <button id="createButton" class="primary" type="button">Create environment</button>
+          </div>
+        </div>
+        <div id="appError" class="notice error" hidden></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Environment</th>
+                <th>Fingerprint</th>
+                <th>Proxy</th>
+                <th>Cloud state</th>
+                <th class="actions-column">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="environmentRows"></tbody>
+          </table>
+          <div id="emptyState" class="empty-state" hidden>
+            <strong>No environments</strong>
+            <span>Create one here or ask an administrator for an assignment.</span>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="createDialog">
+    <form class="environment-form" method="post" action="/api/environments">
+      <input class="csrf-field" type="hidden" name="csrf_token">
+      <header class="dialog-header">
+        <div>
+          <h2>New environment</h2>
+          <p>Cloud profile</p>
+        </div>
+        <button id="closeCreateButton" class="icon-button" type="button" aria-label="Close" title="Close">x</button>
+      </header>
+
+      <div class="form-scroll">
+        <section class="form-section">
+          <h3>Identity</h3>
+          <div class="field-grid two">
+            <label>
+              <span>Name</span>
+              <input name="name" maxlength="100" required autofocus>
+            </label>
+            <label>
+              <span>Tags</span>
+              <input name="tags" placeholder="sales, account-a">
+            </label>
+          </div>
+          <fieldset class="segmented-field">
+            <legend>Cloud storage</legend>
+            <div class="segmented">
+              <label><input type="radio" name="storage_policy" value="shared" checked><span>Shared</span></label>
+              <label><input type="radio" name="storage_policy" value="backup"><span>Backup</span></label>
+            </div>
+          </fieldset>
+          <label>
+            <span>Proxy</span>
+            <input name="proxy" type="password" autocomplete="off" placeholder="http://user:password@host:port">
+          </label>
+        </section>
+
+        <section class="form-section">
+          <h3>Browser fingerprint</h3>
+          <div class="field-grid three">
+            <label>
+              <span>Seed</span>
+              <input name="fingerprint_seed" type="number" min="1" max="2147483647" placeholder="Automatic">
+            </label>
+            <label>
+              <span>Platform</span>
+              <select name="fingerprint_platform">
+                <option value="">Automatic</option>
+                <option value="windows">Windows</option>
+                <option value="macos">macOS</option>
+              </select>
+            </label>
+            <label>
+              <span>Browser</span>
+              <select name="fingerprint_brand">
+                <option value="">Automatic</option>
+                <option>Chrome</option>
+                <option>Edge</option>
+                <option>Opera</option>
+                <option>Vivaldi</option>
+              </select>
+            </label>
+            <label>
+              <span>Browser version</span>
+              <input name="fingerprint_brand_version" placeholder="Automatic">
+            </label>
+            <label>
+              <span>Platform version</span>
+              <input name="fingerprint_platform_version" placeholder="Automatic">
+            </label>
+            <label>
+              <span>CPU cores</span>
+              <input name="hardware_concurrency" type="number" min="0" max="64" placeholder="Automatic">
+            </label>
+            <label>
+              <span>Memory</span>
+              <select name="device_memory_gb">
+                <option value="0">Automatic</option>
+                <option value="1">1 GB</option>
+                <option value="2">2 GB</option>
+                <option value="4">4 GB</option>
+                <option value="8">8 GB</option>
+              </select>
+            </label>
+            <label>
+              <span>Screen width</span>
+              <input name="screen_width" type="number" min="800" max="7680" placeholder="Automatic">
+            </label>
+            <label>
+              <span>Screen height</span>
+              <input name="screen_height" type="number" min="600" max="4320" placeholder="Automatic">
+            </label>
+          </div>
+          <div class="toggle-row">
+            <label><input name="fingerprint_noise" type="checkbox" checked><span>Fingerprint noise</span></label>
+            <label><input name="allow_third_party_cookies" type="checkbox"><span>Third-party cookies</span></label>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <h3>Regional settings</h3>
+          <div class="field-grid three">
+            <label>
+              <span>Timezone</span>
+              <input name="timezone" placeholder="America/New_York">
+            </label>
+            <label>
+              <span>Locale</span>
+              <input name="locale" placeholder="en-US">
+            </label>
+            <label>
+              <span>Location</span>
+              <select name="location">
+                <option value="">None</option>
+                <option value="new-york">New York</option>
+                <option value="chicago">Chicago</option>
+                <option value="denver">Denver</option>
+                <option value="phoenix">Phoenix</option>
+                <option value="los-angeles">Los Angeles</option>
+                <option value="anchorage">Anchorage</option>
+                <option value="honolulu">Honolulu</option>
+              </select>
+            </label>
+          </div>
+          <label>
+            <span>Startup URL</span>
+            <input name="startup_url" type="url" value="about:blank">
+          </label>
+          <div class="toggle-row">
+            <label><input name="geoip" type="checkbox"><span>Proxy geolocation</span></label>
+            <label><input name="humanize" type="checkbox"><span>Humanized input</span></label>
+            <label><input name="headless" type="checkbox"><span>Headless</span></label>
+          </div>
+        </section>
+      </div>
+
+      <footer class="dialog-footer">
+        <button id="cancelCreateButton" class="quiet" type="button">Cancel</button>
+        <button class="primary" type="submit">Create in cloud</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import threading
 import time
@@ -34,6 +35,93 @@ from .extension_packages import install_extension_zip
 
 LEASE_HEARTBEAT_SECONDS = 20.0
 TASK_HEARTBEAT_SECONDS = 30.0
+PROFILE_CRYPTO_FILENAME = ".cloakbrowser-cloud-profile.json"
+PROFILE_CRYPTO_VERSION = 1
+
+
+def _load_or_create_agent_instance_id(root: Path) -> str:
+    path = root / "agent-instance.json"
+
+    def read_existing() -> str:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            instance_id = str(uuid.UUID(str(value.get("instance_id"))))
+        except FileNotFoundError:
+            raise
+        except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Agent instance identity is invalid: {path}") from exc
+        if os.name != "nt" and path.stat().st_mode & 0o077:
+            raise RuntimeError(f"Agent instance identity must use owner-only permissions: {path}")
+        return instance_id
+
+    try:
+        return read_existing()
+    except FileNotFoundError:
+        pass
+
+    instance_id = str(uuid.uuid4())
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = -1
+            json.dump({"instance_id": instance_id}, output, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        return read_existing()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return instance_id
+
+
+def _profile_crypto_descriptor(
+    agent_instance_id: str,
+    system_name: Optional[str] = None,
+) -> dict[str, Any]:
+    current_system = system_name or platform.system()
+    if current_system == "Darwin":
+        return {
+            "version": PROFILE_CRYPTO_VERSION,
+            "platform": "macos",
+            "backend": "mock-keychain",
+            "portable": True,
+        }
+    if current_system == "Linux":
+        return {
+            "version": PROFILE_CRYPTO_VERSION,
+            "platform": "linux",
+            "backend": "basic-password-store",
+            "portable": True,
+        }
+    platform_name = "windows" if current_system == "Windows" else current_system.lower()
+    backend = "dpapi" if current_system == "Windows" else "native-key-store"
+    return {
+        "version": PROFILE_CRYPTO_VERSION,
+        "platform": platform_name,
+        "backend": backend,
+        "portable": False,
+        "agent_instance_id": agent_instance_id,
+    }
+
+
+def _profile_crypto_launch_args(profile_crypto: dict[str, Any]) -> list[str]:
+    if profile_crypto["backend"] == "mock-keychain":
+        return ["--use-mock-keychain"]
+    if profile_crypto["backend"] == "basic-password-store":
+        return ["--password-store=basic"]
+    return []
+
+
+def _profile_crypto_summary(profile_crypto: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": profile_crypto["version"],
+        "platform": profile_crypto["platform"],
+        "backend": profile_crypto["backend"],
+        "portable": profile_crypto["portable"],
+    }
 
 
 class AgentAPIError(RuntimeError):
@@ -105,6 +193,35 @@ class CloudAgentClient:
 
     def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/agent/heartbeat", payload)
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        response = self._request("GET", "/api/agent/environments")
+        environments = response.get("environments")
+        if not isinstance(environments, list) or not all(
+            isinstance(environment, dict) for environment in environments
+        ):
+            raise AgentAPIError("cloud returned an invalid environment list")
+        return environments
+
+    def create_environment(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._request("POST", "/api/agent/environments", payload)
+        environment = response.get("environment")
+        if not isinstance(environment, dict):
+            raise AgentAPIError("cloud returned an invalid environment")
+        return environment
+
+    def request_launch(self, environment_id: str, expected_revision: int) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/agent/environments/{environment_id}/launch",
+            {"expected_revision": expected_revision},
+        )
+
+    def request_stop(self, environment_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/agent/environments/{environment_id}/stop",
+        )
 
     def claim_task(self) -> dict[str, Any]:
         return self._request("POST", "/api/agent/tasks/claim")
@@ -344,6 +461,8 @@ class _LocalBrowser:
     extension_cache_dir: Path
     api: Any
     launcher: Callable[..., Any]
+    profile_crypto: dict[str, Any]
+    state_reporter: Optional[Callable[[str, str, dict[str, Any]], None]] = None
     lease_heartbeat_interval: float = LEASE_HEARTBEAT_SECONDS
     stop_event: threading.Event = field(default_factory=threading.Event)
     ready_event: threading.Event = field(default_factory=threading.Event)
@@ -361,6 +480,14 @@ class _LocalBrowser:
     snapshot_max_bytes: int = 0
     runtime_proxy: str = ""
     extension_paths: list[str] = field(default_factory=list)
+
+    def _report_state(self, phase: str, **details: Any) -> None:
+        if self.state_reporter is not None:
+            try:
+                self.state_reporter(self.environment_id, phase, details)
+            except Exception:
+                # A presentation-layer status callback must not affect the browser.
+                pass
 
     def start(self, timeout: float) -> dict[str, Any]:
         self.thread = threading.Thread(
@@ -380,6 +507,7 @@ class _LocalBrowser:
             "lease_id": self.lease_proof["lease_id"],
             "fencing_token": self.lease_proof["fencing_token"],
             "snapshot_version": self.snapshot_version,
+            "profile_crypto": _profile_crypto_summary(self.profile_crypto),
         }
 
     def matches_lease(self, lease_id: Any, fencing_token: Any) -> bool:
@@ -430,6 +558,7 @@ class _LocalBrowser:
     def _restore_cloud_snapshot(self) -> None:
         if self.lease_proof is None:
             raise RuntimeError("cloud snapshot restore requires an active lease")
+        self._report_state("downloading")
         manifest = self.api.snapshot_manifest(self.environment_id, self.lease_proof)
         self.snapshot_key = decode_snapshot_key(str(manifest.get("encryption_key") or ""))
         version = manifest.get("version")
@@ -454,6 +583,7 @@ class _LocalBrowser:
                 )
             if not self.browser_data_dir.is_dir():
                 raise RuntimeError("local snapshot state exists but browser data is missing")
+            self._ensure_profile_crypto()
             self._upload_cloud_snapshot()
             return
         if version == 0:
@@ -487,8 +617,10 @@ class _LocalBrowser:
                 expected_sha256=expected_sha256,
                 max_snapshot_bytes=max_snapshot_bytes,
             )
+            self._report_state("verifying")
             if file_sha256(download_path) != expected_sha256:
                 raise RuntimeError("downloaded cloud snapshot failed local verification")
+            self._report_state("restoring")
             restore_encrypted_snapshot(
                 download_path,
                 self.browser_data_dir,
@@ -496,6 +628,7 @@ class _LocalBrowser:
                 self.environment_id,
                 version,
                 max_unpacked_bytes=max(512 * 1024 * 1024, max_snapshot_bytes * 8),
+                validate_restored=self._validate_restored_profile_crypto,
             )
             self._write_snapshot_state(version=version, dirty=False)
         finally:
@@ -543,6 +676,90 @@ class _LocalBrowser:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _read_profile_crypto(self, root: Optional[Path] = None) -> Optional[dict[str, Any]]:
+        path = (root or self.browser_data_dir) / PROFILE_CRYPTO_FILENAME
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("cloud profile encryption metadata is invalid") from exc
+        if (
+            not isinstance(value, dict)
+            or isinstance(value.get("version"), bool)
+            or value.get("version") != PROFILE_CRYPTO_VERSION
+            or not isinstance(value.get("platform"), str)
+            or not value["platform"]
+            or not isinstance(value.get("backend"), str)
+            or not value["backend"]
+            or not isinstance(value.get("portable"), bool)
+        ):
+            raise RuntimeError("cloud profile encryption metadata is invalid")
+        if value["portable"]:
+            if "agent_instance_id" in value:
+                raise RuntimeError("cloud profile encryption metadata is invalid")
+        else:
+            try:
+                instance_id = str(uuid.UUID(str(value.get("agent_instance_id"))))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RuntimeError("cloud profile encryption metadata is invalid") from exc
+            if instance_id != value.get("agent_instance_id"):
+                raise RuntimeError("cloud profile encryption metadata is invalid")
+        return value
+
+    def _validate_profile_crypto(self, root: Optional[Path] = None) -> bool:
+        existing = self._read_profile_crypto(root)
+        if existing is None:
+            return False
+        if (
+            existing["platform"] != self.profile_crypto["platform"]
+            or existing["backend"] != self.profile_crypto["backend"]
+            or existing["portable"] != self.profile_crypto["portable"]
+        ):
+            raise RuntimeError(
+                "cloud profile login data was encrypted for "
+                f"{existing['platform']}/{existing['backend']}; this Agent uses "
+                f"{self.profile_crypto['platform']}/{self.profile_crypto['backend']}"
+            )
+        if (
+            not existing["portable"]
+            and existing["agent_instance_id"]
+            != self.profile_crypto["agent_instance_id"]
+        ):
+            raise RuntimeError(
+                "cloud profile login data uses a machine-bound key store and can only "
+                "be restored on the Agent that created it"
+            )
+        return True
+
+    def _write_profile_crypto(self) -> None:
+        path = self.browser_data_dir / PROFILE_CRYPTO_FILENAME
+        temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as output:
+                json.dump(self.profile_crypto, output, separators=(",", ":"))
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                temporary.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _ensure_profile_crypto(self) -> None:
+        if not self._validate_profile_crypto():
+            self._write_profile_crypto()
+
+    def _validate_restored_profile_crypto(self, restore_root: Path) -> None:
+        if not self._validate_profile_crypto(restore_root):
+            raise RuntimeError(
+                "cloud snapshot predates profile-key metadata; open and close it once "
+                "on its original Agent before moving it to another device"
+            )
+
     def _upload_cloud_snapshot(self) -> None:
         if self.lease_proof is None or self.snapshot_key is None:
             raise RuntimeError("cloud snapshot upload requires prepared encryption state")
@@ -550,6 +767,8 @@ class _LocalBrowser:
             f".snapshot-upload-{self.environment_id}-{uuid.uuid4().hex}.cbsnap"
         )
         try:
+            self._ensure_profile_crypto()
+            self._report_state("encrypting")
             artifact = create_encrypted_snapshot(
                 self.browser_data_dir,
                 destination,
@@ -558,6 +777,7 @@ class _LocalBrowser:
                 self.snapshot_version + 1,
                 max_snapshot_bytes=self.snapshot_max_bytes,
             )
+            self._report_state("uploading")
             response = self.api.upload_snapshot(
                 self.environment_id,
                 self.lease_proof,
@@ -570,12 +790,14 @@ class _LocalBrowser:
             self.snapshot_result = dict(snapshot)
             self.snapshot_version = int(snapshot["version"])
             self._write_snapshot_state(version=self.snapshot_version, dirty=False)
+            self._report_state("synced", snapshot_version=self.snapshot_version)
         finally:
             destination.unlink(missing_ok=True)
 
     def _prepare_runtime_assets(self) -> None:
         if self.lease_proof is None:
             raise RuntimeError("runtime assets require an active lease")
+        self._report_state("fetching_assets")
         assets = self.api.runtime_assets(self.environment_id, self.lease_proof)
         proxy = assets.get("proxy", "")
         extensions = assets.get("extensions", [])
@@ -678,6 +900,7 @@ class _LocalBrowser:
         acquired = False
         browser_started = False
         try:
+            self._report_state("acquiring_lease")
             lease_response = self.api.acquire_lease(self.environment_id)
             lease = lease_response.get("lease")
             lease_token = lease_response.get("lease_token")
@@ -711,11 +934,16 @@ class _LocalBrowser:
                 self.browser_data_dir.chmod(0o700)
             except OSError:
                 pass
+            if storage_policy != "local":
+                self._ensure_profile_crypto()
             locale = str(config.get("locale") or "")
             _apply_browser_locale_preferences(self.browser_data_dir, locale)
+            launch_args = _fingerprint_launch_args(config)
+            if storage_policy != "local":
+                launch_args.extend(_profile_crypto_launch_args(self.profile_crypto))
             launch_options: dict[str, Any] = {
                 "headless": bool(config.get("headless", False)),
-                "args": _fingerprint_launch_args(config),
+                "args": launch_args,
                 "timezone": config.get("timezone") or None,
                 "locale": locale or None,
                 "geoip": bool(self.runtime_proxy and config.get("geoip", False)),
@@ -734,6 +962,7 @@ class _LocalBrowser:
                     version=self.snapshot_version,
                     dirty=True,
                 )
+            self._report_state("starting")
             context = self.launcher(self.browser_data_dir, **launch_options)
             browser_started = True
             if self.lease_stale_event.is_set():
@@ -748,6 +977,7 @@ class _LocalBrowser:
                 except Exception:
                     # Navigation failure does not invalidate an interactive browser.
                     pass
+            self._report_state("running", snapshot_version=self.snapshot_version)
             self.ready_event.set()
             while not self.stop_event.wait(0.4):
                 try:
@@ -757,9 +987,11 @@ class _LocalBrowser:
         except Exception as exc:
             if not self.error:
                 self.error = self._redacted_error(exc)
+            self._report_state("error", error=self.error)
         finally:
             self.ready_event.set()
             if context is not None:
+                self._report_state("stopping")
                 try:
                     context.close()
                 except Exception:
@@ -773,6 +1005,7 @@ class _LocalBrowser:
                     self._upload_cloud_snapshot()
                 except Exception as exc:
                     self.sync_error = str(exc)[:1000] or exc.__class__.__name__
+                    self._report_state("error", error=self.sync_error)
             self.lease_stop_event.set()
             if self.lease_thread is not None:
                 self.lease_thread.join(timeout=2.0)
@@ -781,6 +1014,15 @@ class _LocalBrowser:
                     self.api.release_lease(self.environment_id, self.lease_proof)
                 except Exception:
                     pass
+            if (
+                not self.error
+                and not self.sync_error
+                and (
+                    not browser_started
+                    or str(self.environment.get("storage_policy") or "local") == "local"
+                )
+            ):
+                self._report_state("stopped")
             self.exited_event.set()
 
 
@@ -799,6 +1041,10 @@ class AgentRuntime:
         launch_timeout: float = 120.0,
         stop_timeout: float = 600.0,
         reporter: Optional[Callable[[str], None]] = None,
+        state_reporter: Optional[
+            Callable[[str, str, dict[str, Any]], None]
+        ] = None,
+        system_name: Optional[str] = None,
     ) -> None:
         self.api = api
         self.data_dir = Path(data_dir)
@@ -812,6 +1058,7 @@ class AgentRuntime:
         self.launch_timeout = launch_timeout
         self.stop_timeout = stop_timeout
         self.reporter = reporter or (lambda _message: None)
+        self.state_reporter = state_reporter
         self._shutdown = threading.Event()
         self._lock = threading.RLock()
         self._browsers: dict[str, _LocalBrowser] = {}
@@ -829,6 +1076,11 @@ class AgentRuntime:
                 directory.chmod(0o700)
             except OSError:
                 pass
+        self.agent_instance_id = _load_or_create_agent_instance_id(self.data_dir)
+        self.profile_crypto = _profile_crypto_descriptor(
+            self.agent_instance_id,
+            system_name,
+        )
 
     def run(self) -> None:
         next_heartbeat = 0.0
@@ -937,6 +1189,8 @@ class AgentRuntime:
                 extension_cache_dir=self.extension_cache_dir,
                 api=self.api,
                 launcher=self.launcher,
+                profile_crypto=dict(self.profile_crypto),
+                state_reporter=self.state_reporter,
             )
             self._browsers[environment_id] = worker
         try:
@@ -974,6 +1228,7 @@ class AgentRuntime:
             "lease_id": payload["lease_id"],
             "fencing_token": payload["fencing_token"],
             "snapshot_version": worker.snapshot_version,
+            "profile_crypto": _profile_crypto_summary(worker.profile_crypto),
         }
 
     def shutdown(self) -> None:

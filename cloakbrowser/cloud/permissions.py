@@ -5,13 +5,14 @@ from __future__ import annotations
 from typing import FrozenSet
 
 
-ROLES = ("owner", "admin", "operator", "viewer")
+ROLES = ("owner", "admin", "operator", "viewer", "member")
 
 ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
     "owner": frozenset(
         {
             "organization.manage",
             "members.manage",
+            "assignments.manage",
             "agents.read",
             "agents.manage",
             "leases.read",
@@ -32,6 +33,7 @@ ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
     "admin": frozenset(
         {
             "members.manage",
+            "assignments.manage",
             "agents.read",
             "agents.manage",
             "leases.read",
@@ -70,6 +72,17 @@ ROLE_PERMISSIONS: dict[str, FrozenSet[str]] = {
             "tasks.read",
             "snapshots.read",
             "extensions.read",
+        }
+    ),
+    "member": frozenset(
+        {
+            "agents.read",
+            "leases.read",
+            "tasks.read",
+            "snapshots.read",
+            "extensions.read",
+            "environments.read",
+            "environments.launch",
         }
     ),
 }
