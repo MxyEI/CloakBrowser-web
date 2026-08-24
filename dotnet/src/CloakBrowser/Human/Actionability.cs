@@ -129,7 +129,8 @@ public static class Actionability
         string selector,
         IReadOnlySet<string> checks,
         double timeoutMs = 30000,
-        bool force = false)
+        bool force = false,
+        IsolatedWorld? stealth = null)
     {
         if (force)
             return;
@@ -150,6 +151,23 @@ public static class Actionability
 
             try
             {
+                // Prefer the isolated-world read; fall back to Playwright's locator
+                // predicates only for selector grammar the isolated world can't resolve.
+                if (stealth != null)
+                {
+                    var (st, vis, en, ed) = await StealthDom.ActionableAsync(stealth, selector).ConfigureAwait(false);
+                    if (st == StealthStatus.Ok)
+                    {
+                        if (checks.Contains("visible") && !vis) throw new ElementNotVisibleError(selector);
+                        if (checks.Contains("enabled") && !en) throw new ElementNotEnabledError(selector);
+                        if (checks.Contains("editable") && !ed) throw new ElementNotEditableError(selector);
+                        return;
+                    }
+                    if (st == StealthStatus.NotFound)
+                        throw new ElementNotAttachedError(selector);
+                    // Unsupported -> Playwright below
+                }
+
                 var loc = page.Locator(selector).First;
 
                 if (checks.Contains("attached"))
@@ -191,17 +209,43 @@ public static class Actionability
     // Post-scroll stability check
     // -----------------------------------------------------------------------
 
-    private static bool BoxesDiffer(LocatorBoundingBoxResult a, LocatorBoundingBoxResult b) =>
+    private static bool BoxesDiffer(BoundingBox a, BoundingBox b) =>
         Math.Abs(a.X - b.X) > 1
         || Math.Abs(a.Y - b.Y) > 1
         || Math.Abs(a.Width - b.Width) > 1
         || Math.Abs(a.Height - b.Height) > 1;
 
     /// <summary>
+    /// Bounding box via the isolated world, falling back to Playwright. Returns null
+    /// when the element is not present. Only an unsupported selector (or no world)
+    /// reaches Playwright's BoundingBox; a genuine not-found stays in-world.
+    /// </summary>
+    private static async Task<BoundingBox?> ReadBoxAsync(
+        IPage page, string selector, IsolatedWorld? stealth, double remainingMs)
+    {
+        if (stealth != null)
+        {
+            var (status, box) = await StealthDom.BoxAsync(stealth, selector).ConfigureAwait(false);
+            if (status == StealthStatus.Ok) return box;
+            if (status == StealthStatus.NotFound) return null;
+            // Unsupported -> Playwright below
+        }
+        try
+        {
+            var b = await page.Locator(selector).First.BoundingBoxAsync(new LocatorBoundingBoxOptions
+            {
+                Timeout = (float)Math.Max(1, Math.Min(remainingMs, 1000)),
+            }).ConfigureAwait(false);
+            return b == null ? null : new BoundingBox(b.X, b.Y, b.Width, b.Height);
+        }
+        catch (Exception) { return null; }
+    }
+
+    /// <summary>
     /// Wait for the element's position to stabilize (two samples 100ms apart).
     /// Only call after a scroll - skip if the element was already in the viewport.
     /// </summary>
-    public static async Task EnsureStableAsync(IPage page, string selector, double timeoutMs = 5000)
+    public static async Task EnsureStableAsync(IPage page, string selector, double timeoutMs = 5000, IsolatedWorld? stealth = null)
     {
         double deadline = NowMs() + timeoutMs;
         int attempt = 0;
@@ -212,24 +256,17 @@ public static class Actionability
             if (remainingMs <= 0)
                 throw new ElementNotStableError(selector);
 
-            var loc = page.Locator(selector).First;
-            var box1 = await loc.BoundingBoxAsync(new LocatorBoundingBoxOptions
-            {
-                Timeout = (float)Math.Max(1, Math.Min(remainingMs, 1000)),
-            }).ConfigureAwait(false);
+            var box1 = await ReadBoxAsync(page, selector, stealth, remainingMs).ConfigureAwait(false);
             if (box1 == null)
                 throw new ElementNotAttachedError(selector);
 
             await Task.Delay(100).ConfigureAwait(false);
 
-            var box2 = await loc.BoundingBoxAsync(new LocatorBoundingBoxOptions
-            {
-                Timeout = (float)Math.Max(1, Math.Min(remainingMs, 1000)),
-            }).ConfigureAwait(false);
+            var box2 = await ReadBoxAsync(page, selector, stealth, remainingMs).ConfigureAwait(false);
             if (box2 == null)
                 throw new ElementNotAttachedError(selector);
 
-            if (!BoxesDiffer(box1, box2))
+            if (!BoxesDiffer(box1.Value, box2.Value))
                 return;
 
             if (NowMs() >= deadline)
@@ -281,41 +318,75 @@ public static class Actionability
         string selector,
         double x,
         double y,
-        double timeoutMs = 5000)
+        double timeoutMs = 5000,
+        IsolatedWorld? stealth = null)
     {
         double deadline = NowMs() + timeoutMs;
         int attempt = 0;
+        string? lastMiss = null;
 
         while (true)
         {
             PointerResult? result = null;
-            try
+            // Isolated-world hit test; fall back to Playwright only for unsupported selectors.
+            bool handled = false;
+            if (stealth != null)
             {
-                var loc = page.Locator(selector).First;
-                var box = await loc.BoundingBoxAsync(new LocatorBoundingBoxOptions
+                var (status, hit, cov) = await StealthDom.PointerAsync(stealth, selector, x, y).ConfigureAwait(false);
+                if (status == StealthStatus.Ok)
                 {
-                    Timeout = (float)Math.Max(1, Math.Min(deadline - NowMs(), 1000)),
-                }).ConfigureAwait(false);
-                var data = new
+                    result = new PointerResult { Hit = hit, Covering = cov };
+                    handled = true;
+                }
+                else if (status == StealthStatus.NotFound)
                 {
-                    x,
-                    y,
-                    box = box == null ? null : new { x = box.X, y = box.Y, width = box.Width, height = box.Height },
-                };
-                result = await loc.EvaluateAsync<PointerResult?>(PointerEventsJs, data).ConfigureAwait(false);
+                    result = null; // indeterminate -> proceed (fail-open)
+                    handled = true;
+                }
             }
-            catch (Exception exc)
+            if (!handled)
             {
-                CloakLog.Debug($"pointer_events check failed for '{selector}': {exc.Message}");
-                result = null;
+                try
+                {
+                    var loc = page.Locator(selector).First;
+                    var box = await loc.BoundingBoxAsync(new LocatorBoundingBoxOptions
+                    {
+                        Timeout = (float)Math.Max(1, Math.Min(deadline - NowMs(), 1000)),
+                    }).ConfigureAwait(false);
+                    var data = new
+                    {
+                        x,
+                        y,
+                        box = box == null ? null : new { x = box.X, y = box.Y, width = box.Width, height = box.Height },
+                    };
+                    result = await loc.EvaluateAsync<PointerResult?>(PointerEventsJs, data).ConfigureAwait(false);
+                }
+                catch (Exception exc)
+                {
+                    CloakLog.Debug($"pointer_events check failed for '{selector}': {exc.Message}");
+                    result = null;
+                }
             }
 
             // Proceed if the check confirms a hit, or if it could not be determined
             // (null) - failing closed would block legitimate clicks.
-            if (result == null || result.Hit)
+            // An indeterminate result (null) fails open - failing closed would
+            // block legitimate clicks. But once a miss has been *determined*, a
+            // later indeterminate attempt must not launder it into a pass: near
+            // the deadline the BoundingBox timeout is clamped to ~1ms and always
+            // throws, which used to turn a proven miss into "unknown" and let the
+            // click through silently (#329).
+            if (result == null)
+            {
+                if (lastMiss != null && NowMs() >= deadline)
+                    throw new ElementNotReceivingEventsError(selector, lastMiss);
+                return;
+            }
+            if (result.Hit)
                 return;
 
             string covering = result.Covering ?? "unknown";
+            lastMiss = covering;
 
             if (NowMs() >= deadline)
                 throw new ElementNotReceivingEventsError(selector, covering);
@@ -414,6 +485,7 @@ public static class Actionability
     {
         double deadline = NowMs() + timeoutMs;
         int attempt = 0;
+        string? lastMiss = null;
 
         while (true)
         {
@@ -434,10 +506,20 @@ public static class Actionability
                 result = null;
             }
 
-            if (result == null || result.Hit)
+            // See the locator variant: an indeterminate result fails open, but a
+            // miss that was already determined must not be laundered into a pass
+            // by a late attempt that merely errored (#329).
+            if (result == null)
+            {
+                if (lastMiss != null && NowMs() >= deadline)
+                    throw new ElementNotReceivingEventsError("<ElementHandle>", lastMiss);
+                return;
+            }
+            if (result.Hit)
                 return;
 
             string covering = result.Covering ?? "unknown";
+            lastMiss = covering;
 
             if (NowMs() >= deadline)
                 throw new ElementNotReceivingEventsError("<ElementHandle>", covering);

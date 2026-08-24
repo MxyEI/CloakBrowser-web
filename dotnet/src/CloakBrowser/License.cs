@@ -11,6 +11,32 @@ namespace CloakBrowser;
 /// </summary>
 public sealed record LicenseInfo(bool Valid, string Plan, string? Expires);
 
+/// <summary>
+/// Result of a seat lookup: the count, the cap it counts against, and the reason
+/// either is missing. Mirrors the Python <c>SessionSeats</c> dataclass / JS
+/// <c>SessionSeats</c> interface.
+/// </summary>
+/// <remarks>
+/// <see cref="State"/> is one of:
+/// <list type="bullet">
+/// <item><c>"ok"</c> — Active is a real number (0 is a real answer, not an error)</item>
+/// <item><c>"unreachable"</c> — never got an answer: DNS, refused, timeout, TLS</item>
+/// <item><c>"denied"</c> — the server refused; <see cref="Reason"/> carries its error code</item>
+/// <item><c>"unknown"</c> — the server is up and the key is fine, but it cannot count
+/// right now (leaseless mode, or its seat store is unreachable)</item>
+/// </list>
+/// <see cref="Limit"/> is null whenever the server declined to state a cap: unlimited,
+/// an unrecognised plan, or a server too old to send the field. Callers must fall back
+/// to the bare count, never invent a denominator.
+/// </remarks>
+public sealed record SessionSeats
+{
+    public int? Active { get; init; }
+    public int? Limit { get; init; }
+    public string State { get; init; } = "ok";
+    public string? Reason { get; init; }
+}
+
 /// <summary>Server-resolved Pro release for the requested channel and platform.</summary>
 public sealed record ProReleaseInfo(
     string Version, string RequestedChannel, string ResolvedChannel, bool Fallback);
@@ -117,6 +143,128 @@ public static class License
         return msg is not null ? new CloakBrowserLicenseError(msg, ex) : null;
     }
 
+    /// <summary>
+    /// Env var the wrapper uses to tell the Pro binary where to record a license
+    /// denial. A denial that resolves AFTER the CDP handshake (e.g. an over-cap
+    /// seat) kills the browser once the driver already holds a live connection,
+    /// so the exit code never reaches the wrapper as a launch failure. The binary
+    /// writes the code to this path just before exiting; the wrapper reads it when
+    /// the user's next call fails. Old binaries ignore the unknown var.
+    /// </summary>
+    public const string LicenseStatusFileEnv = "CLOAKBROWSER_LICENSE_STATUS_FILE";
+
+    /// <summary>
+    /// Maps a raw license exit code (76-79) to a <see cref="CloakBrowserLicenseError"/>,
+    /// or null for any code that is not a known license denial (so a genuine crash
+    /// is never mislabelled). Companion to <see cref="LicenseErrorMessage"/> for the
+    /// post-handshake file path where we hold the integer directly.
+    /// </summary>
+    public static CloakBrowserLicenseError? LicenseErrorForCode(int code)
+    {
+        return LicenseExitMessages.TryGetValue(code, out var msg)
+            ? new CloakBrowserLicenseError(msg)
+            : null;
+    }
+
+    /// <summary>
+    /// Reads and consumes a denial file written by the binary, returning its code.
+    /// The file holds a single JSON integer (the exit code). Reading is destructive:
+    /// the file is deleted afterwards so a later launch can't see a stale code. Any
+    /// problem — absent, unreadable, or not a valid int — yields null.
+    /// </summary>
+    // Once a denial has been observed for a per-launch path, remember it. The
+    // read is destructive, so a concurrent second guarded call for the same
+    // launch would otherwise find the file gone and miss the denial. Paths are
+    // unique per launch; ConcurrentDictionary since Tasks may run on the pool.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> ObservedDenials = new();
+
+    public static int? ReadDenialFile(string filePath)
+    {
+        if (ObservedDenials.TryGetValue(filePath, out var cached)) return cached;
+        // Fast path: the guard calls this after EVERY browser call to catch a
+        // denial that lands while calls still succeed, so the no-denial case
+        // (file absent) must be cheap — a single stat, not a read+throw per call.
+        if (!File.Exists(filePath)) return null;
+        int? code = null;
+        try
+        {
+            var raw = File.ReadAllText(filePath);
+            // Parse as tolerantly as Python (int(json.load)) and JS
+            // (Number(JSON.parse)): accept a bare JSON number AND a quoted or
+            // whitespace-padded value, so all three wrappers read an identical
+            // denial file the same way.
+            using var doc = JsonDocument.Parse(raw);
+            var el = doc.RootElement;
+            code = el.ValueKind switch
+            {
+                JsonValueKind.Number => el.GetInt32(),
+                JsonValueKind.String => int.Parse(
+                    el.GetString()!, System.Globalization.CultureInfo.InvariantCulture),
+                _ => throw new FormatException("denial file is not a number"),
+            };
+        }
+        catch
+        {
+            code = null;
+        }
+        try { File.Delete(filePath); } catch { /* best-effort cleanup */ }
+        if (code.HasValue)
+        {
+            ObservedDenials[filePath] = code.Value;
+            return code;
+        }
+        // File gone/garbage: a concurrent reader may have already recorded it.
+        return ObservedDenials.TryGetValue(filePath, out var c2) ? c2 : (int?)null;
+    }
+
+    /// <summary>
+    /// Returns a fresh, unique path for the binary to write a denial code to. Only
+    /// computes the path (and ensures the parent dir exists) — the file is created
+    /// by the binary, and only on a denial, so a granted launch leaves nothing
+    /// behind. Returns null if the directory can't be created; the caller then skips
+    /// the feature (the fix must never break a launch).
+    /// </summary>
+    public static string? MintDenialFile()
+    {
+        try
+        {
+            var home = HomeDirOverride?.Invoke()
+                ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var denialDir = Path.Combine(home, ".cloakbrowser", "denials");
+            Directory.CreateDirectory(denialDir);
+            SweepStaleDenials(denialDir);
+            return Path.Combine(denialDir, $"{Guid.NewGuid():N}.json");
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // A denial file is orphaned when the binary writes one but the user never
+    // calls a guarded method afterwards. It is only consumed on a guarded call,
+    // so sweep leftovers older than this at mint time — long enough that a live
+    // in-flight denial from a concurrent launch is never deleted before its
+    // owner reads it.
+    private static readonly TimeSpan DenialFileTtl = TimeSpan.FromHours(1);
+
+    private static void SweepStaleDenials(string denialDir)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - DenialFileTtl;
+            foreach (var f in Directory.EnumerateFiles(denialDir, "*.json"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(f) < cutoff) File.Delete(f);
+                }
+                catch { /* best-effort */ }
+            }
+        }
+        catch { /* best-effort */ }
+    }
+
     // -----------------------------------------------------------------------
     // Testing seams - mirror the monkey-patching the Python/JS tests rely on.
     // Null means "use real behavior" (HTTP). Tests inject deterministic results
@@ -134,6 +282,9 @@ public static class License
 
     /// <summary>Overrides the live seat-count lookup for tests. Null -> real HTTP.</summary>
     internal static Func<string, int?>? ActiveSessionCountOverride;
+
+    /// <summary>Overrides the full seat lookup (count + cap + state) for tests. Null -> real HTTP.</summary>
+    internal static Func<string, SessionSeats>? SessionSeatsOverride;
 
     /// <summary>
     /// Resolves the user home directory used to detect the default
@@ -218,7 +369,30 @@ public static class License
     /// </summary>
     public static Dictionary<string, string>? BuildLaunchEnv(
         string? licenseKey = null,
-        Dictionary<string, string>? userEnv = null)
+        Dictionary<string, string>? userEnv = null,
+        string? statusFile = null)
+    {
+        var result = BuildKeyEnv(licenseKey, userEnv);
+
+        // Add the denial-status file path last so it rides along even on the
+        // inherit-parent-env (null) paths, which then have to become a full
+        // parent-env copy (Playwright replaces, not merges). Only set when the
+        // caller asked for it, which it only does when a license key is in play.
+        if (statusFile != null)
+        {
+            result ??= Environment.GetEnvironmentVariables()
+                .Cast<System.Collections.DictionaryEntry>()
+                .ToDictionary(e => (string)e.Key, e => (string)e.Value!);
+            result[LicenseStatusFileEnv] = statusFile;
+        }
+
+        return result;
+    }
+
+    /// <summary>The license-key half of BuildLaunchEnv (unchanged behavior).</summary>
+    private static Dictionary<string, string>? BuildKeyEnv(
+        string? licenseKey,
+        Dictionary<string, string>? userEnv)
     {
         var (key, source) = ResolveLicenseKeyWithSource(licenseKey);
 
@@ -469,37 +643,125 @@ public static class License
         GetProLatestRelease(releaseChannel)?.Version;
 
     /// <summary>
-    /// How many concurrent sessions (seats) this license is holding right now.
+    /// Seats held right now, the cap they count against, and why either is missing.
     /// </summary>
     /// <remarks>
-    /// Deliberately NOT cached: a cached seat count is a wrong seat count. Returns
-    /// null when the number is unknown — the server couldn't be reached, or it
-    /// reported the count as unavailable (it does that instead of a false 0 while
-    /// running in leaseless mode). Callers render null as "unavailable".
+    /// Deliberately NOT cached: a cached seat count is a wrong seat count.
+    /// <para>
+    /// Six different things can stop us answering — no route to the host, a timeout,
+    /// a 403 for a dead key, a 429, the server reporting the count as unknown in
+    /// leaseless mode, and its seat store being unreachable. They used to collapse
+    /// into one bare null, so <c>info</c> printed the same "unavailable" for "your
+    /// key is dead" and "our backend is degraded, you are fine". <see
+    /// cref="SessionSeats.State"/> keeps them apart.
+    /// </para>
     /// </remarks>
-    public static int? GetActiveSessionCount(string licenseKey)
+    public static SessionSeats GetSessionSeats(string licenseKey)
     {
+        if (SessionSeatsOverride != null)
+            return SessionSeatsOverride(licenseKey);
         if (ActiveSessionCountOverride != null)
-            return ActiveSessionCountOverride(licenseKey);
+        {
+            // Older tests (and any external caller) seam in only the number.
+            var only = ActiveSessionCountOverride(licenseKey);
+            return only is null
+                ? new SessionSeats { State = "unknown" }
+                : new SessionSeats { Active = only, State = "ok" };
+        }
 
+        HttpResponseMessage resp;
         try
         {
             var body = new StringContent(
                 JsonSerializer.Serialize(new Dictionary<string, string> { ["license_key"] = licenseKey }),
                 Encoding.UTF8, "application/json");
-            using var resp = Http.PostAsync(SessionCountUrl, body).GetAwaiter().GetResult();
-            resp.EnsureSuccessStatusCode();
-            var json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            using var doc = JsonDocument.Parse(json);
-            return doc.RootElement.TryGetProperty("active", out var a) && a.ValueKind == JsonValueKind.Number
-                ? a.GetInt32() : null;
+            resp = Http.PostAsync(SessionCountUrl, body).GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
-            CloakLog.Debug("Session count lookup failed: {0}", ex.Message);
-            return null;
+            // Never reached the server: DNS, refused, timed out, TLS.
+            CloakLog.Debug("Session count lookup unreachable: {0}", ex.Message);
+            return new SessionSeats { State = "unreachable" };
+        }
+
+        using (resp)
+        {
+            string json;
+            try
+            {
+                json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                CloakLog.Debug("Session count body unreadable: {0}", ex.Message);
+                return new SessionSeats { State = resp.IsSuccessStatusCode ? "unknown" : "denied",
+                                          Reason = resp.IsSuccessStatusCode ? null : $"HTTP {(int)resp.StatusCode}" };
+            }
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                // The server answered, and the answer was a refusal. Its `error` field is
+                // the actionable part (invalid_key / license_inactive / rate_limited);
+                // fall back to the status when the body is missing or not JSON.
+                string? reason = null;
+                try
+                {
+                    using var errDoc = JsonDocument.Parse(json);
+                    if (errDoc.RootElement.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String)
+                        reason = e.GetString();
+                }
+                catch (JsonException)
+                {
+                    // fall through to the status
+                }
+                reason ??= $"HTTP {(int)resp.StatusCode}";
+                CloakLog.Debug("Session count denied: {0}", reason);
+                return new SessionSeats { State = "denied", Reason = reason };
+            }
+
+            JsonDocument doc;
+            try
+            {
+                doc = JsonDocument.Parse(json);
+            }
+            catch (JsonException ex)
+            {
+                CloakLog.Debug("Session count body unparseable: {0}", ex.Message);
+                return new SessionSeats { State = "unknown" };
+            }
+
+            using (doc)
+            {
+                if (!doc.RootElement.TryGetProperty("active", out var a) || a.ValueKind != JsonValueKind.Number)
+                {
+                    // 200 with active=null is the server saying "up, your key is fine, but
+                    // I genuinely cannot count right now" — deliberate, so it never
+                    // reports a false 0.
+                    return new SessionSeats { State = "unknown" };
+                }
+
+                // limit absent (older server) or null (unlimited / unknown plan): callers
+                // fall back to the bare count rather than printing a made-up denominator.
+                int? limit = doc.RootElement.TryGetProperty("limit", out var l) && l.ValueKind == JsonValueKind.Number
+                    ? l.GetInt32() : null;
+                return new SessionSeats { Active = a.GetInt32(), Limit = limit, State = "ok" };
+            }
         }
     }
+
+    /// <summary>
+    /// How many concurrent sessions (seats) this license is holding right now.
+    /// </summary>
+    /// <remarks>
+    /// Kept for callers outside <c>info</c> that only want the number. Prefer
+    /// <see cref="GetSessionSeats"/>, which also carries the cap and the reason a
+    /// lookup failed.
+    /// </remarks>
+    public static int? GetActiveSessionCount(string licenseKey) =>
+        // Straight through GetSessionSeats, which honours both override seams itself.
+        // Re-checking ActiveSessionCountOverride here would give the two methods
+        // different precedence if a test ever set both, and disagree about the count.
+        GetSessionSeats(licenseKey).Active;
 
     // -----------------------------------------------------------------------
     // Cache helpers (atomic write via tmp+rename, like Python/JS).

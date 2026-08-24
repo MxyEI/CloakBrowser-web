@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Microsoft.Playwright;
 
 namespace CloakBrowser.Human;
 
@@ -41,6 +42,12 @@ public interface IRawEvaluator
 /// </summary>
 public static class HumanKeyboard
 {
+    /// <summary>Press a key while preserving the caller's keydown-to-keyup delay.</summary>
+    internal static Task PressAsync(IKeyboard keyboard, string key, float? delay = null) =>
+        keyboard.PressAsync(
+            key,
+            delay.HasValue ? new KeyboardPressOptions { Delay = delay.Value } : null);
+
     /// <summary>Characters that require holding Shift to produce.</summary>
     public static readonly IReadOnlySet<char> ShiftSymbols =
         new HashSet<char>("@#!$%^&*()_+{}|:\"<>?~");

@@ -36,7 +36,7 @@ Drop-in Playwright/Puppeteer replacement for Python and JavaScript.<br>
 Same API, same code — just swap the import. <strong>3 lines of code, 30 seconds to unblock.</strong>
 </p>
 
-- **71 source-level C++ patches** — canvas, WebGL, audio, fonts, GPU, screen, WebRTC, network timing, automation signals, CDP input behavior
+- **73 source-level C++ patches** — canvas, WebGL, audio, fonts, GPU, screen, WebRTC, network timing, automation signals, CDP input behavior
 - **`humanize=True`** — human-like mouse curves, keyboard timing, and scroll patterns. One flag, behavioral detection passes
 - **Pro: 0.9 reCAPTCHA v3 score** — human-level, server-verified
 - **Passes Cloudflare Turnstile**, FingerprintJS, BrowserScan — tested against 30+ detection sites
@@ -404,11 +404,13 @@ page.goto("https://example.com")
 
 ---
 
-## Latest: v0.5.2 — 71 source-level stealth patches (Chromium 150.0.7871.114.3 — all platforms)
+## Latest: v0.5.8 — 73 source-level stealth patches (Chromium 151.0.7922.108.2 — Linux + Windows)
 
-- **CloakBrowser Pro** — the latest binary (Chromium 150.0.7871.114.3, 71 source-level patches) is available to Pro subscribers on **Linux, Windows, and macOS**. Set a `license_key` (`licenseKey` in JS) or the `CLOAKBROWSER_LICENSE_KEY` env var and the wrapper fetches the latest build automatically. See [CloakBrowser Pro](#cloakbrowser-pro)
+- **CloakBrowser Pro Stable** — Chromium `151.0.7922.108.2` on Linux x64, Linux ARM64, and Windows x64; macOS remains on `150.0.7871.114.3`. Set a `license_key` (`licenseKey` in JS) or the `CLOAKBROWSER_LICENSE_KEY` env var and the wrapper fetches the latest Stable build for your platform automatically. See [CloakBrowser Pro](#cloakbrowser-pro)
+- **CloakBrowser Pro Preview** — Chromium `151.0.7922.108.3` on Linux x64, Linux ARM64, Windows x64, and macOS. Opt in with `release_channel="preview"` or `CLOAKBROWSER_RELEASE_CHANNEL=preview`.
 - **.NET 8 / C# client** — CloakBrowser now ships as a NuGet package (`CloakBrowser`), mirroring the Python and JS wrappers.
-- **71 fingerprint patches** — rendering consistency improvements across Linux and Windows, corrected GPU/display/graphics parameters to match stock Chrome profiles
+- **Chromium 151 upgrade** — rebased the full patch set onto Chromium 151 (Linux + Windows), re-validated against reference data; macOS remains on the Chromium 150 Stable line
+- **73 fingerprint patches** — rendering consistency improvements across Linux and Windows, corrected GPU/display/graphics parameters to match stock Chrome profiles
 - **Windows native GPU passthrough** — real hardware values pass through directly instead of being spoofed, matching real browser behavior
 - **HTTP proxy inline credentials** — new network-layer support for proxies with inline authentication
 - **`extension_paths`** — load Chrome extensions in all launch functions
@@ -440,7 +442,7 @@ CloakBrowser doesn't solve CAPTCHAs — it prevents them from appearing. No CAPT
 
 Anti-bot systems change every week and an older binary quietly degrades. The latest build is the one that keeps passing. **Try it free, then upgrade when you're running for real.**
 
-- **Free, latest build (Chromium 150)** — the newest binary, the exact one that stays [green against live detection](#test-results). Free with a GitHub sign-in, one concurrent session. [Grab your key](https://cloakbrowser.dev/free) or run `cloakbrowser login`, then throw it at your hardest target.
+- **Free, latest build (Chromium 151)** — the newest binary, the exact one that stays [green against live detection](#test-results). Free with a GitHub sign-in, one concurrent session. [Grab your key](https://cloakbrowser.dev/free) or run `cloakbrowser login`, then throw it at your hardest target.
 - **Pro** — when it's part of production scraping, QA, monitoring, or automation: scale to **5, 20, 200, 2,000, or more concurrent sessions**, always first on the newest patches, with hands-on support. Linux, Windows, macOS. **[See plans and pricing →](https://cloakbrowser.dev)**
 - **v146** — the older build stays free on [GitHub Releases](https://github.com/CloakHQ/cloakbrowser/releases). A quick first look, but it ages fast as detection evolves.
 
@@ -452,9 +454,25 @@ export CLOAKBROWSER_LICENSE_KEY=cb_xxxxxxxx
 
 Try the latest free → **[cloakbrowser.dev/free](https://cloakbrowser.dev/free)**  ·  Scale up on Pro → **[cloakbrowser.dev](https://cloakbrowser.dev)**
 
+## CloakBrowser Manager
+
+**The anti-detect browser, with a GUI.** A self-hosted alternative to Multilogin, GoLogin, and AdsPower, running on this same engine, on your own machine, not someone else's cloud.
+
+Every profile is a genuinely separate computer: its own fingerprint, GPU, screen, timezone, proxy, cookies, and history. Nothing bleeds between them. Close a profile, reopen it next month, and it's the same person, warmed up and ready.
+
+- **Unlimited profiles** — the big brands charge per profile and push you up a tier when you hit the ceiling. Here profiles are unlimited and you pay only for how many run at the same time. A drawer full of dormant accounts costs nothing.
+- **Native desktop app** — profiles open as normal windows on Windows and macOS. On a Linux server they run in Docker and stream to your browser.
+- **The real engine** — most profile managers inject JavaScript into a stock browser. Every profile here runs the patched Chromium binary this repo ships.
+- **Automate what you can see** — every running profile exposes a CDP endpoint. Drive it with Playwright or Puppeteer while you watch the exact same window live.
+- **One key, both products** — your CloakBrowser key works in the Manager too. Free with a GitHub sign-in for one profile at a time.
+
+It's also the fastest way to try the browser without writing any code: download, create a profile, click **Launch**.
+
+[**Get the Manager →**](https://cloakbrowser.dev/manager) · [Manager repo](https://github.com/CloakHQ/CloakBrowser-Manager) — the GUI is open source (MIT)
+
 ## Test Results
 
-All tests verified against live detection services. Results below are for the latest Pro/current build unless noted. Last tested: Jul 2026 (Chromium 150).
+All tests verified against live detection services. Results below are for the latest Pro/current build unless noted. Last tested: Aug 2026 (Chromium 151).
 
 | Detection Service | Stock Playwright | CloakBrowser | Notes |
 |---|---|---|---|
@@ -469,7 +487,7 @@ All tests verified against live detection services. Results below are for the la
 | `navigator.webdriver` | `true` | **`false`** | Source-level patch |
 | `navigator.plugins.length` | 0 | **5** | Real plugin list |
 | `window.chrome` | `undefined` | **`object`** | Present like real Chrome |
-| UA string | `HeadlessChrome` | **`Chrome/146.0.0.0`** | No headless leak |
+| UA string | `HeadlessChrome` | **`Chrome/151.0.0.0`** | No headless leak |
 | CDP detection | Detected | **Not detected** | `isAutomatedWithCDP: false` |
 | TLS fingerprint | Mismatch | **Identical to Chrome** | ja3n/ja4/akamai match |
 | | | **Tested against 30+ detection sites** | |
@@ -523,7 +541,7 @@ CloakBrowser is a thin wrapper (Python + JavaScript) around a custom-built Chrom
 3. **Every launch** → Playwright or Puppeteer starts with our binary + stealth args
 4. **You write code** → standard Playwright/Puppeteer API, nothing new to learn
 
-The binary includes 71 source-level patches covering canvas, WebGL, audio, fonts, GPU, screen properties, WebRTC, network timing, hardware reporting, automation signal removal, and CDP input behavior mimicking.
+The binary includes 73 source-level patches covering canvas, WebGL, audio, fonts, GPU, screen properties, WebRTC, network timing, hardware reporting, automation signal removal, and CDP input behavior mimicking.
 
 These are compiled into the Chromium binary — not injected via JavaScript, not set via flags.
 
@@ -738,7 +756,7 @@ python -m cloakbrowser clear-cache  # Remove cached binaries
 
 `login` with no argument prompts you to paste a license key or press Enter to get a free key via a GitHub sign-in; `login <key>` saves a key directly. Both validate the key, then store it at `~/.cloakbrowser/license.key` so every launch picks it up.
 
-`info` reports the binary that will actually launch given your license, runs a quick launch test (and flags missing system libraries on Linux), shows your license tier, and checks fonts, GeoIP, and optional dependencies. Add `--quick` to skip the launch test or `--json` for machine-readable output.
+`info` reports the binary that will actually launch given your license, runs a quick launch test (and flags missing system libraries on Linux), shows your license tier, and checks fonts, GeoIP, and optional dependencies. Add `--quick` to skip the launch test or `--json` for machine-readable output. Add `--proxy <url>` to resolve the exit IP, timezone, and locale a launch would apply through that proxy (the same `geoip=True` resolution; downloads the GeoIP DB if not cached) — useful for confirming a proxy hands you a timezone/locale that matches its exit IP.
 
 `CLOAKBROWSER_RELEASE_CHANNEL=preview` also applies to `install`, `info`, and `update`. `info` shows the exact version that will launch and whether Preview resolved to Stable for the current platform.
 
@@ -981,7 +999,6 @@ Supported by the binary but **not set by default** — pass via `args` to custom
 | `--fingerprint-locale` | Locale (e.g. `en-US`) |
 | `--fingerprint-storage-quota` | Override storage quota in MB — affects `storage.estimate()`, `storageBuckets`, and legacy webkit APIs. Auto-normalized when `--fingerprint` is set |
 | `--fingerprint-taskbar-height` | Override taskbar height (binary defaults: Win=48, Mac=95, Linux=0) |
-| `--fingerprint-fonts-dir` | Path to directory containing target-platform fonts (see [Font Setup on Linux](#font-setup-on-linux)) |
 | `--fingerprint-windows-font-metrics` | **Chromium 148+ binary only** (no-op on earlier builds). Align font metrics with the Windows platform when spoofing Windows on Linux — used in the [FingerprintJS config](#detected-by-fingerprintjs). Requires Windows fonts installed (see [Font Setup on Linux](#font-setup-on-linux)); no effect without them |
 | `--fingerprint-webrtc-ip` | WebRTC ICE candidate IP replacement. Use `auto` to resolve from proxy exit IP (makes an HTTP call through the proxy), or pass an explicit IP. Auto-injected when `geoip=True` |
 | `--fingerprint-noise=false` | Disable noise injection (canvas, WebGL, audio, client rects) while keeping the deterministic fingerprint seed active |
@@ -995,7 +1012,9 @@ Supported by the binary but **not set by default** — pass via `args` to custom
 
 ### Font Setup on Linux
 
-**Required for aggressive anti-bot sites (Kasada, Akamai).** These systems render emoji on a hidden canvas and hash the pixel output. Minimal Linux environments (Docker, cloud VMs) often lack emoji and extended fonts, producing hashes that don't match any real browser. Install standard font packages to fix this:
+On Linux, CloakBrowser spoofs the **Windows** platform by default. Two font layers matter, and most setups only do the first:
+
+**1. Baseline (minimal) — emoji + CJK canvas fonts.** Aggressive anti-bot systems (Kasada, Akamai) render emoji on a hidden canvas and hash the pixel output. Minimal Linux environments (Docker, cloud VMs) lack these, producing hashes that don't match any real browser. This is the floor, not the finish line:
 
 ```bash
 sudo apt install -y fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
@@ -1004,20 +1023,17 @@ sudo apt install -y fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
 
 The Docker image (`cloakhq/cloakbrowser`) ships with these pre-installed. If you run the binary directly on a Linux server or in a custom Docker image, install them manually.
 
-**Optional: Windows fonts for CreepJS font enumeration.** The packages above fix anti-bot canvas checks but won't improve your CreepJS font score. For that, you need actual Windows fonts (Segoe UI, Calibri, Bahnschrift, etc.) from a Windows machine's `C:\Windows\Fonts\` directory — `ttf-mscorefonts-installer` only has old XP-era fonts and isn't enough.
+**2. Real Windows fonts — strongly recommended (required for `--fingerprint-windows-font-metrics`).** Since the Linux default persona is Windows, a Windows browser with no Windows fonts is itself a bot tell: font-fingerprinting anti-bot (FingerprintJS) flags the mismatch, and CreepJS font enumeration scores poorly. The apt packages above do **not** provide these — they are Microsoft-proprietary and cannot be installed from a package repo, and `ttf-mscorefonts-installer` only has old XP-era fonts (not enough).
+
+Copy the fonts from a real Windows machine's `C:\Windows\Fonts\` directory. The wrapper keeps warning until it finds all of: **Segoe UI, Segoe UI Light, Calibri, Marlett, MS UI Gothic, Franklin Gothic, Consolas, Courier New** (copying the whole `Fonts` folder covers these and more):
 
 ```bash
 mkdir -p ~/.local/share/fonts/windows
-cp /path/to/windows/fonts/*.ttf ~/.local/share/fonts/windows/
-cp /path/to/windows/fonts/*.TTF ~/.local/share/fonts/windows/
-fc-cache -f  # mandatory for manually copied fonts
+cp -r /path/to/windows/Fonts/. ~/.local/share/fonts/windows/
+fc-cache -f
 ```
 
-```python
-browser = launch(
-    args=["--fingerprint-fonts-dir=/home/user/.local/share/fonts/windows"],
-)
-```
+Confirm they registered with `fc-list | grep -i "segoe\|calibri\|consolas"`. Once all are present the warning stops on its own; set `CLOAKBROWSER_SUPPRESS_FONT_WARNING=1` to silence it if you accept the tradeoff.
 
 ### Examples
 
@@ -1101,11 +1117,11 @@ browser = await launch_async(args=["--remote-debugging-port=9242"])
 
 | Platform | Free | Pro | Status |
 |---|---|---|---|
-| Linux x86_64 | Chromium 146 (58 patches) | Chromium 150 (71 patches) | ✅ |
-| Linux arm64 (RPi, Graviton) | Chromium 146 (58 patches) | Chromium 150 (71 patches) | ✅ |
+| Linux x86_64 | Chromium 146 (58 patches) | Chromium 151 (73 patches) | ✅ |
+| Linux arm64 (RPi, Graviton) | Chromium 146 (58 patches) | Chromium 151 (73 patches) | ✅ |
 | macOS arm64 (Apple Silicon) | Chromium 145 (26 patches) | Chromium 150 (71 patches) | ✅ |
 | macOS x86_64 (Intel) | Chromium 145 (26 patches) | Chromium 150 (71 patches) | ✅ |
-| Windows x86_64 | Chromium 146 (58 patches) | Chromium 150 (71 patches) | ✅ |
+| Windows x86_64 | Chromium 146 (58 patches) | Chromium 151 (73 patches) | ✅ |
 
 The wrapper auto-downloads the correct binary for your platform.
 
@@ -1168,7 +1184,13 @@ browser = pw.chromium.connect_over_cdp("http://localhost:9222")
 page = browser.new_page()
 page.goto("https://example.com")
 print(page.title())
-browser.close()
+browser.close()  # Disconnects from CDP; cloakserve keeps Chrome running
+```
+
+With `connect_over_cdp()`, Playwright does not own the remote Chrome process. `browser.close()` only disconnects the client, so Chrome keeps running and continues holding its Pro session seat. To terminate it immediately, connect with a named `fingerprint` seed and call the close endpoint:
+
+```bash
+curl -X POST http://localhost:9222/fingerprint/11111/close
 ```
 
 If your framework needs a direct WebSocket endpoint, fetch Chrome's discovery document and use the rewritten `webSocketDebuggerUrl`. The URL points back through `cloakserve` so the CDP proxy can keep per-seed routing intact:
@@ -1258,7 +1280,7 @@ b4 = pw.chromium.connect_over_cdp(
 
 Supported query params: `fingerprint`, `timezone`, `locale`, `platform`, `platform-version`, `brand`, `brand-version`, `gpu-vendor`, `gpu-renderer`, `hardware-concurrency`, `device-memory`, `screen-width`, `screen-height`, `proxy`, `geoip`. Same seed reuses the same process (first connection's params win). No seed = shared default process (backward compatible).
 
-By default, per-seed processes stay alive until `cloakserve` exits. If clients create many unique seeds, set `--idle-timeout=SECONDS` or `CLOAKSERVE_IDLE_TIMEOUT=SECONDS` to automatically terminate a seed's Chrome process after its last CDP WebSocket disconnects. `0`, `off`, `false`, `none`, or `disabled` disable idle cleanup. When cleanup runs, the seed's temporary profile directory under `--data-dir` is removed too. Check active processes at `GET /` (returns JSON with PIDs, ports, connection counts, idle timeout, and pending cleanup status).
+By default, per-seed processes stay alive until `cloakserve` exits; idle cleanup is disabled (`0`). If clients create many unique seeds, set `--idle-timeout=SECONDS` or `CLOAKSERVE_IDLE_TIMEOUT=SECONDS` to automatically terminate a seed's Chrome process after its last CDP WebSocket disconnects. `0`, `off`, `false`, `none`, or `disabled` disable idle cleanup. When cleanup runs, the seed's temporary profile directory under `--data-dir` is removed too. Check active processes at `GET /` (returns JSON with PIDs, ports, connection counts, idle timeout, and pending cleanup status).
 
 **Persistent profiles** — mount a volume to keep cookies and sessions across container restarts:
 
@@ -1374,7 +1396,7 @@ FingerprintJS (`demo.fingerprint.com/playground`) checks multiple signals. Each 
 
 | Detection | Cause | Fix |
 |-----------|-------|-----|
-| **`nodriver` / bad bot** | Stale binary/wrapper, missing current FPJS patches, or poor proxy IP reputation | Upgrade to the latest Pro binary (`150.0.7871.114.3+`), use a residential proxy with `geoip=True`, and use the config below. |
+| **`nodriver` / bad bot** | Stale binary/wrapper, missing current FPJS patches, or poor proxy IP reputation | Upgrade to the latest Pro binary for your platform, use a residential proxy with `geoip=True`, and use the config below. |
 | **Browser tampering** | Noise injection detected by ML | `--fingerprint-noise=false` |
 | **Browser tampering** (fonts) | Font metrics don't match the spoofed Windows platform | `--fingerprint-windows-font-metrics` (Chromium 148+ binary; requires [Windows fonts installed](#font-setup-on-linux)) |
 | **Virtual machine** | Screen dimensions don't match viewport | `--fingerprint-screen-width/height` matching viewport |

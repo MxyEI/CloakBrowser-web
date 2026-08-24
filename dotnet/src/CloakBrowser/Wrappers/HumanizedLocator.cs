@@ -19,13 +19,19 @@ public sealed partial class HumanizedLocator : ILocator
     private readonly ILocator _inner;
     private readonly HumanCursor _cursor;
     private readonly HumanConfig _cfg;
+    private readonly string? _selector;
 
-    internal HumanizedLocator(ILocator inner, HumanCursor cursor, HumanConfig cfg)
+    internal HumanizedLocator(ILocator inner, HumanCursor cursor, HumanConfig cfg, string? selector = null)
     {
         _inner = inner;
         _cursor = cursor;
         _cfg = cfg;
+        _selector = selector;
     }
+
+    /// <summary>The CSS/XPath selector this locator was built from (page.Locator(selector)),
+    /// or null for chained/GetBy* locators. Drives the isolated-world pre-click reads.</summary>
+    internal string? Selector => _selector;
 
     /// <summary>The original, un-humanized Playwright locator (escape hatch for raw speed).</summary>
     public ILocator Original => _inner;
@@ -40,39 +46,41 @@ public sealed partial class HumanizedLocator : ILocator
     // -----------------------------------------------------------------------
 
     public Task ClickAsync(LocatorClickOptions? options = null) =>
-        LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options));
+        LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector);
 
     public Task DblClickAsync(LocatorDblClickOptions? options = null) =>
-        LocatorHumanizer.DblClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options));
+        LocatorHumanizer.DblClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector);
 
     public Task HoverAsync(LocatorHoverOptions? options = null) =>
-        LocatorHumanizer.HoverAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options));
+        LocatorHumanizer.HoverAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector);
 
     public Task TapAsync(LocatorTapOptions? options = null) =>
-        LocatorHumanizer.TapAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options));
+        LocatorHumanizer.TapAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector);
 
     public Task FillAsync(string value, LocatorFillOptions? options = null) =>
-        LocatorHumanizer.FillAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), value);
+        LocatorHumanizer.FillAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), value, _selector);
 
     public Task TypeAsync(string text, LocatorTypeOptions? options = null) =>
-        LocatorHumanizer.TypeAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), text);
+        LocatorHumanizer.TypeAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), text, _selector);
 
     public Task PressSequentiallyAsync(string text, LocatorPressSequentiallyOptions? options = null) =>
-        LocatorHumanizer.PressSequentiallyAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), text);
+        LocatorHumanizer.PressSequentiallyAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), text, _selector);
 
     public Task PressAsync(string key, LocatorPressOptions? options = null) =>
-        LocatorHumanizer.PressAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), key);
+        LocatorHumanizer.PressAsync(
+            _inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options),
+            key, OptionReader.Delay(options), _selector);
 
     public async Task CheckAsync(LocatorCheckOptions? options = null)
     {
         if (!await _inner.IsCheckedAsync().ConfigureAwait(false))
-            await LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+            await LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
     }
 
     public async Task UncheckAsync(LocatorUncheckOptions? options = null)
     {
         if (await _inner.IsCheckedAsync().ConfigureAwait(false))
-            await LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+            await LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
     }
 
     public async Task SetCheckedAsync(bool checkedState, LocatorSetCheckedOptions? options = null)
@@ -81,7 +89,7 @@ public sealed partial class HumanizedLocator : ILocator
         try { current = await _inner.IsCheckedAsync().ConfigureAwait(false); }
         catch (System.Exception) { current = !checkedState; }
         if (current != checkedState)
-            await LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+            await LocatorHumanizer.ClickAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
     }
 
     public async Task DragToAsync(ILocator target, LocatorDragToOptions? options = null)
@@ -115,37 +123,37 @@ public sealed partial class HumanizedLocator : ILocator
 
     public async Task<IReadOnlyList<string>> SelectOptionAsync(string values, LocatorSelectOptionOptions? options = null)
     {
-        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
         return await _inner.SelectOptionAsync(values, options).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<string>> SelectOptionAsync(IElementHandle values, LocatorSelectOptionOptions? options = null)
     {
-        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
         return await _inner.SelectOptionAsync(Unwrap(values), options).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<string>> SelectOptionAsync(IEnumerable<string> values, LocatorSelectOptionOptions? options = null)
     {
-        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
         return await _inner.SelectOptionAsync(values, options).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<string>> SelectOptionAsync(SelectOptionValue values, LocatorSelectOptionOptions? options = null)
     {
-        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
         return await _inner.SelectOptionAsync(values, options).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<string>> SelectOptionAsync(IEnumerable<IElementHandle> values, LocatorSelectOptionOptions? options = null)
     {
-        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
         return await _inner.SelectOptionAsync(values.Select(Unwrap), options).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<string>> SelectOptionAsync(IEnumerable<SelectOptionValue> values, LocatorSelectOptionOptions? options = null)
     {
-        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options)).ConfigureAwait(false);
+        await LocatorHumanizer.SelectOptionPrologueAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector).ConfigureAwait(false);
         return await _inner.SelectOptionAsync(values, options).ConfigureAwait(false);
     }
 
@@ -154,7 +162,7 @@ public sealed partial class HumanizedLocator : ILocator
     // instead of an instant value reset.
 
     public Task ClearAsync(LocatorClearOptions? options = null) =>
-        LocatorHumanizer.ClearAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options));
+        LocatorHumanizer.ClearAsync(_inner, _cursor, _cfg, OptionReader.Timeout(options), OptionReader.Force(options), _selector);
 
     private static IElementHandle Unwrap(IElementHandle handle) =>
         handle is HumanizedElementHandle h ? h.Original : handle;

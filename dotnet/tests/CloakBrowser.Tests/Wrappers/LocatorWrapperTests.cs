@@ -94,6 +94,34 @@ public class LocatorWrapperTests
     }
 
     [Fact]
+    public async Task Frame_PressAsync_forwards_delay()
+    {
+        var (page, _, kbRec) = BuildPage();
+        var (locator, _) = BuildLocator(evaluateResult: true);
+        var (frame, frameRec) = Fake.Of<IFrame>();
+        frameRec.On("Locator", locator);
+        var human = new HumanizedFrame(frame, new HumanCursor(page), FastConfig());
+
+        await human.PressAsync("#field", "Control+V", new FramePressOptions { Delay = 300 });
+
+        var options = Assert.IsType<KeyboardPressOptions>(kbRec.Last("PressAsync")!.Args[1]);
+        Assert.Equal(300, options.Delay);
+    }
+
+    [Fact]
+    public async Task ElementHandle_PressAsync_forwards_delay()
+    {
+        var (page, _, kbRec) = BuildPage();
+        var (element, _) = Fake.Of<IElementHandle>();
+        var human = new HumanizedElementHandle(element, new HumanCursor(page), FastConfig());
+
+        await human.PressAsync("Control+V", new ElementHandlePressOptions { Delay = 300 });
+
+        var options = Assert.IsType<KeyboardPressOptions>(kbRec.Last("PressAsync")!.Args[1]);
+        Assert.Equal(300, options.Delay);
+    }
+
+    [Fact]
     public async Task SelectOptionAsync_runs_humanized_hover_then_delegates()
     {
         var (page, mouseRec, _) = BuildPage();

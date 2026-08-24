@@ -48,8 +48,9 @@
 
 import type { Browser, Page, Frame, CDPSession, ElementHandle, BrowserContext } from 'puppeteer-core';
 import type { HumanConfig, HumanActionOptions } from '../human/config.js';
-import { resolveConfig, mergeConfig, rand, randRange, sleep } from '../human/config.js';
-import { RawMouse, RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from '../human/mouse.js';
+import { mergeConfig, rand, randRange, sleep } from '../human/config.js';
+import { type RawMouse, type RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from '../human/mouse.js';
+import { pressWithDelay } from '../human/keyboard.js';
 import { humanType } from './keyboard.js';
 import { scrollToElement, humanScrollIntoView, smoothWheel } from './scroll.js';
 
@@ -286,7 +287,11 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   let cdpSession: CDPSession | null = null;
   const ensureCdp = async (): Promise<CDPSession | null> => {
     if (!cdpSession) {
-      try { cdpSession = await stealth.getCdpSession(); } catch {}
+      try {
+        cdpSession = await stealth.getCdpSession();
+      } catch (error) {
+        console.error('[cloakbrowser] Failed to create humanize CDP session:', error);
+      }
     }
     return cdpSession;
   };
@@ -424,7 +429,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   // ============================================================
   // Mouse patches
   // ============================================================
-  page.mouse.move = async (x: number, y: number, options?: { steps?: number }) => {
+  page.mouse.move = async (x: number, y: number, _options?: { steps?: number }) => {
     await ensureCursorInit();
     await humanMove(raw, cursor.x, cursor.y, x, y, cfg);
     cursor.x = x;
@@ -471,7 +476,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     (page.mouse as any).dragAndDrop = async (
       start: { x: number; y: number },
       target: { x: number; y: number },
-      options?: { delay?: number },
+      _options?: { delay?: number },
     ) => {
       await ensureCursorInit();
       await humanMove(raw, cursor.x, cursor.y, start.x, start.y, cfg);
@@ -491,16 +496,14 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   // ============================================================
   // Keyboard patches
   // ============================================================
-  page.keyboard.type = async (text: string, options?: { delay?: number }) => {
+  page.keyboard.type = async (text: string, _options?: { delay?: number }) => {
     const cdp = await ensureCdp();
     await humanType(page, rawKb, text, cfg, cdp);
   };
 
   page.keyboard.press = async (key: any, options?: { delay?: number }) => {
     await sleep(rand(20, 60));
-    await originals.keyboardDown(key as any);
-    await sleep(randRange(cfg.key_hold));
-    await originals.keyboardUp(key as any);
+    await pressWithDelay(originals.keyboardPress, key, options, randRange(cfg.key_hold));
   };
 
   page.keyboard.down = async (key: any) => {
@@ -734,9 +737,7 @@ function patchSingleElementHandle(
   if (origElPress) {
     (el as any).press = async (key: string, options?: { delay?: number }) => {
       await sleep(rand(20, 60));
-      await originals.keyboardDown(key as any);
-      await sleep(randRange(cfg.key_hold));
-      await originals.keyboardUp(key as any);
+      await pressWithDelay(originals.keyboardPress, key, options, randRange(cfg.key_hold));
     };
   }
 
@@ -845,8 +846,31 @@ function patchFrames(
   originals: any,
   stealth: StealthEval,
 ): void {
-  for (const frame of iterFrames(page)) {
+  const patchFrame = (frame: Frame): void => {
+    if ((frame as any)._humanPatched) return;
     patchSingleFrame(frame, page, cfg, cursor, raw, rawKb, originals, stealth);
+    (frame as any)._humanPatched = true;
+  };
+
+  if (!(page as any)._humanFrameListenerAttached) {
+    page.on('frameattached', (frame: Frame) => {
+      try {
+        patchFrame(frame);
+      } catch (error) {
+        console.error('[cloakbrowser] Failed to humanize dynamically attached frame:', error);
+        throw error;
+      }
+    });
+    // Invalidate the isolated world on any main-frame nav, not just goto, so
+    // click/form navigations don't leave it bound to a stale doc (#507).
+    page.on('framenavigated', (frame: Frame) => {
+      if (stealth && frame === page.mainFrame()) stealth.invalidate();
+    });
+    (page as any)._humanFrameListenerAttached = true;
+  }
+
+  for (const frame of iterFrames(page)) {
+    patchFrame(frame);
   }
 }
 
@@ -860,9 +884,6 @@ function patchSingleFrame(
   originals: any,
   stealth: StealthEval,
 ): void {
-  if ((frame as any)._humanPatched) return;
-  (frame as any)._humanPatched = true;
-
   const origFrameSelect = frame.select.bind(frame);
 
   (frame as any).click = async (selector: string, options?: HumanActionOptions & {
@@ -936,7 +957,9 @@ function* iterFrames(page: Page): Generator<Frame> {
     for (const child of mainFrame.childFrames()) {
       yield child;
     }
-  } catch {}
+  } catch (error) {
+    console.error('[cloakbrowser] Failed to enumerate page frames:', error);
+  }
 }
 
 
@@ -992,7 +1015,9 @@ export function patchBrowser(browser: Browser, cfg: HumanConfig): void {
           patchPage(page, cfg, new CursorState());
         }
       }
-    } catch {}
+    } catch (error) {
+      console.error('[cloakbrowser] Failed to humanize newly created page:', error);
+    }
   });
 }
 

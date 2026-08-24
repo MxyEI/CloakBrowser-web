@@ -10,9 +10,15 @@ import {
   getProLatestRelease,
   getProLatestVersion,
   getActiveSessionCount,
+  getSessionSeats,
   buildLaunchEnv,
   licenseErrorMessage,
   licenseErrorFrom,
+  licenseErrorForCode,
+  readDenialFile,
+  mintDenialFile,
+  installLicenseGuard,
+  LICENSE_STATUS_FILE_ENV,
   CloakBrowserLicenseError,
 } from "../src/license.js";
 
@@ -573,6 +579,229 @@ describe("buildLaunchEnv", () => {
     expect(buildLaunchEnv("")).toBeUndefined();
     expect(buildLaunchEnv("   ")).toBeUndefined();
   });
+
+  it("statusFile is carried on an inherit-parent-env path", () => {
+    const prev = process.env.CLOAKBROWSER_LICENSE_KEY;
+    process.env.CLOAKBROWSER_LICENSE_KEY = "cb_env";
+    try {
+      const result = buildLaunchEnv(undefined, undefined, "/tmp/denials/x.json");
+      expect(result).toBeDefined();
+      expect(result![LICENSE_STATUS_FILE_ENV]).toBe("/tmp/denials/x.json");
+      expect(result!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_env");
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_LICENSE_KEY;
+      else process.env.CLOAKBROWSER_LICENSE_KEY = prev;
+    }
+  });
+
+  it("omitting statusFile preserves original behavior", () => {
+    const prev = process.env.CLOAKBROWSER_LICENSE_KEY;
+    process.env.CLOAKBROWSER_LICENSE_KEY = "cb_env";
+    try {
+      expect(buildLaunchEnv()).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.CLOAKBROWSER_LICENSE_KEY;
+      else process.env.CLOAKBROWSER_LICENSE_KEY = prev;
+    }
+  });
+});
+
+// ── post-handshake denial: helpers + guard ─────────────
+describe("denial file + license guard", () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloak-denial-"));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it.each([
+    [76, "session limit"],
+    [77, "invalid, expired, or missing"],
+    [78, "couldn't verify"],
+    [79, "not writable"],
+  ])("licenseErrorForCode maps %i", (code, fragment) => {
+    const err = licenseErrorForCode(code as number);
+    expect(err).toBeInstanceOf(CloakBrowserLicenseError);
+    expect(err!.message).toContain(fragment as string);
+  });
+
+  it("licenseErrorForCode returns null for an unknown code", () => {
+    expect(licenseErrorForCode(1)).toBeNull();
+    expect(licenseErrorForCode(0)).toBeNull();
+  });
+
+  it("readDenialFile returns the code and consumes the file", () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    expect(readDenialFile(f)).toBe(76);
+    expect(fs.existsSync(f)).toBe(false);
+  });
+
+  it("readDenialFile still returns the code on a second read after it was consumed", () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    expect(readDenialFile(f)).toBe(76);
+    expect(fs.existsSync(f)).toBe(false);   // consumed
+    expect(readDenialFile(f)).toBe(76);     // file gone, cached in-process
+  });
+
+  it("readDenialFile returns null for missing/garbage", () => {
+    expect(readDenialFile(path.join(tmpDir, "nope.json"))).toBeNull();
+    const bad = path.join(tmpDir, "bad.json");
+    fs.writeFileSync(bad, "not-json");
+    expect(readDenialFile(bad)).toBeNull();
+    expect(fs.existsSync(bad)).toBe(false);
+  });
+
+  it("mintDenialFile returns a path under a denials dir", () => {
+    const spy = vi.spyOn(os, "homedir").mockReturnValue(tmpDir);
+    try {
+      const p = mintDenialFile();
+      expect(p).toBeDefined();
+      expect(p!.endsWith(".json")).toBe(true);
+      expect(p).toContain("denials");
+      expect(fs.existsSync(path.join(tmpDir, ".cloakbrowser", "denials"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("mintDenialFile sweeps stale denial files but keeps fresh ones", () => {
+    const spy = vi.spyOn(os, "homedir").mockReturnValue(tmpDir);
+    try {
+      const denials = path.join(tmpDir, ".cloakbrowser", "denials");
+      fs.mkdirSync(denials, { recursive: true });
+      const stale = path.join(denials, "stale.json");
+      fs.writeFileSync(stale, "76");
+      const old = Date.now() / 1000 - 7200; // 2h ago (seconds for utimesSync)
+      fs.utimesSync(stale, old, old);
+      const fresh = path.join(denials, "fresh.json"); // a concurrent live denial
+      fs.writeFileSync(fresh, "76");
+
+      mintDenialFile();
+
+      expect(fs.existsSync(stale)).toBe(false); // orphan swept
+      expect(fs.existsSync(fresh)).toBe(true);  // in-flight denial untouched
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  const NAV_METHODS = ["goto", "reload", "waitForLoadState", "waitForURL", "waitForSelector"];
+
+  it("guard raises CloakBrowserLicenseError when the denial file is present", async () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const target: any = {
+      newPage: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    installLicenseGuard(target, f);
+    await expect(target.newPage()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  it("guard passes the original error through when there is no file", async () => {
+    const original = new Error("real crash");
+    const target: any = { newPage: async () => { throw original; } };
+    installLicenseGuard(target, path.join(tmpDir, "absent.json"));
+    await expect(target.newPage()).rejects.toBe(original);
+  });
+
+  it("guard passes through when the file is garbage", async () => {
+    const f = path.join(tmpDir, "bad.json");
+    fs.writeFileSync(f, "garbage");
+    const original = new Error("real crash");
+    const target: any = { newPage: async () => { throw original; } };
+    installLicenseGuard(target, f);
+    await expect(target.newPage()).rejects.toBe(original);
+  });
+
+  // The binary writes the denial file the instant it's over cap but keeps
+  // serving (blank) responses for ~1s before it exits, so a fast flow that never
+  // throws must still surface it. The guard checks the file after every call.
+  it("guard surfaces a denial on a SUCCESSFUL call", async () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const target: any = { goto: async () => "ok" }; // resolves, never throws
+    installLicenseGuard(target, f);
+    await expect(target.goto()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  // Sync methods (url(), isClosed(), on()) must stay sync — wrapping them in an
+  // async function would turn their return value into a Promise and break them.
+  it("guard preserves a sync method's return value", () => {
+    const target: any = { url: () => "https://example.com" };
+    installLicenseGuard(target, path.join(tmpDir, "absent.json"));
+    expect(target.url()).toBe("https://example.com"); // not a Promise
+  });
+
+  it("guard surfaces a denial from a sync method too", () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const target: any = { url: () => "https://example.com" };
+    installLicenseGuard(target, f);
+    expect(() => target.url()).toThrow(CloakBrowserLicenseError);
+  });
+
+  // A persistent context arrives with pages()[0] already open, so the user
+  // navigates that page directly and never calls newPage. The pre-open page's
+  // navigation entry points must surface the denial too.
+  it.each([...NAV_METHODS])(
+    "guard surfaces the denial on a pre-open page's %s()",
+    async (method) => {
+      const f = path.join(tmpDir, "d.json");
+      fs.writeFileSync(f, "76");
+      const page: any = {};
+      for (const m of NAV_METHODS) {
+        page[m] = async () => { throw new Error("Target page, context or browser has been closed"); };
+      }
+      installLicenseGuard(page, f);
+      await expect(page[method]()).rejects.toThrow(CloakBrowserLicenseError);
+    },
+  );
+
+  it("pre-open page guard passes a genuine failure through untouched", async () => {
+    const original = new Error("real crash");
+    const page: any = { goto: async () => { throw original; } };
+    installLicenseGuard(page, path.join(tmpDir, "absent.json"));
+    await expect(page.goto()).rejects.toBe(original);
+  });
+
+  // A denial that lands AFTER launch — once the user already holds a page from
+  // newPage() — must surface on that page's first call. newPage/newContext/
+  // createBrowserContext deep-guard the object they return.
+  it("deep-guards the page a factory hands back", async () => {
+    const f = path.join(tmpDir, "d.json");
+    const page: any = { goto: async () => { throw new Error("Target page, context or browser has been closed"); } };
+    const browser: any = { newPage: async () => page };
+    installLicenseGuard(browser, f);
+    const created = await browser.newPage();   // succeeds; no denial yet
+    fs.writeFileSync(f, "76");                  // denial lands after handover
+    await expect(created.goto()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  it("deep-guards newPage on a context a factory hands back", async () => {
+    const f = path.join(tmpDir, "d.json");
+    const ctx: any = {
+      newPage: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    const browser: any = { createBrowserContext: async () => ctx };
+    installLicenseGuard(browser, f);
+    const created = await browser.createBrowserContext();  // succeeds; no denial yet
+    fs.writeFileSync(f, "76");                              // denial lands after handover
+    await expect(created.newPage()).rejects.toThrow(CloakBrowserLicenseError);
+  });
+
+  it("surfaces a denial thrown during context creation", async () => {
+    const f = path.join(tmpDir, "d.json");
+    fs.writeFileSync(f, "76");
+    const browser: any = {
+      createBrowserContext: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    installLicenseGuard(browser, f);
+    await expect(browser.createBrowserContext()).rejects.toThrow(CloakBrowserLicenseError);
+  });
 });
 
 describe("license exit-code surfacing", () => {
@@ -681,5 +910,110 @@ describe("getActiveSessionCount", () => {
     await getActiveSessionCount("cb_key");
     await getActiveSessionCount("cb_key");
     expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── getSessionSeats ───────────────────────────────────
+
+describe("getSessionSeats", () => {
+  // The six failure paths that used to collapse into one bare null.
+  const ok = (payload: unknown) =>
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => payload,
+    } as Response);
+
+  const denied = (status: number, payload: unknown) =>
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status,
+      statusText: "Denied",
+      json: async () => payload,
+    } as Response);
+
+  it("reports the count and the limit", async () => {
+    ok({ valid: true, active: 8, limit: 2000 });
+    expect(await getSessionSeats("cb_key")).toEqual({
+      active: 8, limit: 2000, state: "ok", reason: null,
+    });
+  });
+
+  it("treats a missing limit as null, not an error", async () => {
+    // A server predating the field still yields a usable count.
+    ok({ valid: true, active: 8 });
+    const seats = await getSessionSeats("cb_key");
+    expect(seats.state).toBe("ok");
+    expect(seats.active).toBe(8);
+    expect(seats.limit).toBeNull();
+  });
+
+  it("treats an explicit null limit as null", async () => {
+    // Unlimited licence or unrecognised plan — the server says so explicitly.
+    ok({ valid: true, active: 3, limit: null });
+    expect((await getSessionSeats("cb_key")).limit).toBeNull();
+  });
+
+  it("keeps zero seats as a real answer", async () => {
+    ok({ valid: true, active: 0, limit: 5 });
+    const seats = await getSessionSeats("cb_key");
+    expect(seats.state).toBe("ok");
+    expect(seats.active).toBe(0);
+  });
+
+  it("reports a network failure as unreachable", async () => {
+    // info is a diagnostic — it degrades, it never throws out of the command.
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("timeout"));
+    const seats = await getSessionSeats("cb_key");
+    expect(seats.state).toBe("unreachable");
+    expect(seats.active).toBeNull();
+  });
+
+  it("carries the server's reason on a denial", async () => {
+    denied(403, { valid: false, error: "license_inactive" });
+    const seats = await getSessionSeats("cb_key");
+    expect(seats.state).toBe("denied");
+    expect(seats.reason).toBe("license_inactive");
+  });
+
+  it("treats a rate limit as a denial", async () => {
+    denied(429, { valid: false, error: "rate_limited" });
+    expect((await getSessionSeats("cb_key")).reason).toBe("rate_limited");
+  });
+
+  it("falls back to the status when a denial has no body", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: "Server Error",
+      json: async () => {
+        throw new Error("not json");
+      },
+    } as unknown as Response);
+    expect((await getSessionSeats("cb_key")).reason).toBe("HTTP 500");
+  });
+
+  it("reports a server-side unknown as unknown, not denied", async () => {
+    // Leaseless mode: 200, key is fine, the server just cannot count. This is the
+    // distinction the old single null destroyed.
+    ok({ valid: true, active: null, limit: null });
+    const seats = await getSessionSeats("cb_key");
+    expect(seats.state).toBe("unknown");
+    expect(seats.active).toBeNull();
+  });
+
+  it("reports an unparseable body as unknown", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => {
+        throw new Error("not json");
+      },
+    } as unknown as Response);
+    expect((await getSessionSeats("cb_key")).state).toBe("unknown");
+  });
+
+  it("keeps getActiveSessionCount returning the bare count", async () => {
+    // It is shipped public API — it must keep behaving.
+    ok({ valid: true, active: 4, limit: 20 });
+    expect(await getActiveSessionCount("cb_key")).toBe(4);
   });
 });

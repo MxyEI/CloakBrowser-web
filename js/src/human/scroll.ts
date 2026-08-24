@@ -5,6 +5,7 @@
 import type { Page } from 'playwright-core';
 import { HumanConfig, rand, randRange, randIntRange, sleep } from './config.js';
 import { RawMouse, humanMove } from './mouse.js';
+import { buildBoxJs, evalParsed, getWorld, OK, NOT_FOUND, UNSUPPORTED, VIEWPORT_JS } from './stealthDom.js';
 
 interface ElementBounds {
   x: number;
@@ -23,6 +24,26 @@ function isInViewport(
   const zoneTop = viewportHeight * cfg.scroll_target_zone[0];
   const zoneBottom = viewportHeight * cfg.scroll_target_zone[1];
   return topEdge >= zoneTop && bottomEdge <= zoneBottom;
+}
+
+const SCROLL_JS =
+  '(() => { const e = document.scrollingElement || document.documentElement;' +
+  ' return { y: window.scrollY, maxY: Math.max(0, e.scrollHeight - e.clientHeight) }; })()';
+
+/** Current vertical scroll offset and the maximum scrollable offset. */
+async function readScrollState(page: Page): Promise<{ y: number; maxY: number }> {
+  const world = getWorld(page);
+  if (world) {
+    try { return await world.evaluate(SCROLL_JS); } catch { /* fall back below */ }
+  }
+  try {
+    return await page.evaluate(() => {
+      const e = document.scrollingElement || document.documentElement;
+      return { y: window.scrollY, maxY: Math.max(0, e.scrollHeight - e.clientHeight) };
+    });
+  } catch {
+    return { y: 0, maxY: 0 };
+  }
 }
 
 async function smoothWheel(raw: RawMouse, delta: number, cfg: HumanConfig): Promise<void> {
@@ -58,9 +79,17 @@ export async function humanScrollIntoView(
   // dimensions so humanize works headed (the stealth-relevant mode).
   let viewport = page.viewportSize();
   if (!viewport) {
-    viewport = await page.evaluate(
-      () => ({ width: window.innerWidth, height: window.innerHeight }),
-    );
+    // Read the live window dimensions through the isolated world, consistent with
+    // the other geometry reads here.
+    const world = getWorld(page);
+    if (world) {
+      try { viewport = await world.evaluate(VIEWPORT_JS); } catch { /* fall back below */ }
+    }
+    if (!viewport) {
+      viewport = await page.evaluate(
+        () => ({ width: window.innerWidth, height: window.innerHeight }),
+      );
+    }
   }
   if (!viewport || !viewport.height) throw new Error('Viewport size not available');
 
@@ -69,6 +98,18 @@ export async function humanScrollIntoView(
 
   if (isInViewport(box, viewport.height, cfg)) {
     return { box, cursorX, cursorY, didScroll: false };
+  }
+
+  // Already fully visible but off-center, with the page pinned at the boundary
+  // in the needed direction: scrolling can't help, so don't waste the budget.
+  const fullyVisible = box.y >= 0 && box.y + box.height <= viewport.height;
+  if (fullyVisible) {
+    const zoneMid = viewport.height * (cfg.scroll_target_zone[0] + cfg.scroll_target_zone[1]) / 2;
+    const needUp = box.y + box.height / 2 < zoneMid;
+    const { y, maxY } = await readScrollState(page);
+    if (needUp ? y <= 0 : y >= maxY) {
+      return { box, cursorX, cursorY, didScroll: false };
+    }
   }
 
   // Move cursor into scroll area
@@ -175,11 +216,30 @@ export async function scrollToElement(
   );
 }
 
-async function getElementBox(
+export async function getElementBox(
   page: Page,
   selector: string,
   timeout: number = 30000,
 ): Promise<ElementBounds | null> {
+  // Read geometry through the isolated world when available; a not-found is retried
+  // briefly in-world (SPA re-renders) and only an unsupported selector reaches
+  // Playwright's boundingBox.
+  const world = getWorld(page);
+  if (world) {
+    let { status, data } = await evalParsed(world, buildBoxJs(selector));
+    if (status === OK) return data.box;
+    if (status === NOT_FOUND) {
+      const deadline = Date.now() + Math.min(timeout, 2000);
+      while (Date.now() < deadline) {
+        await sleep(50);
+        ({ status, data } = await evalParsed(world, buildBoxJs(selector)));
+        if (status === OK) return data.box;
+        if (status === UNSUPPORTED) break;
+      }
+      if (status !== UNSUPPORTED) return null;
+    }
+    // UNSUPPORTED -> Playwright fallback below
+  }
   const el = page.locator(selector).first();
   try {
     const box = await el.boundingBox({ timeout: Math.max(1, timeout) });

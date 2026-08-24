@@ -67,11 +67,12 @@ public class FocusCheckTests
         var (page, mouseRec, kbRec) = BuildPage();
         var human = new HumanizedLocator(BuildLocator(focused: true), new HumanCursor(page), FastConfig());
 
-        await human.PressAsync("Enter");
+        await human.PressAsync("Control+V", new LocatorPressOptions { Delay = 300 });
 
         Assert.Equal(0, mouseRec.CountOf("MoveAsync"));  // cursor did not move
         Assert.Equal(0, mouseRec.CountOf("DownAsync"));  // no click
-        Assert.True(kbRec.CountOf("PressAsync") >= 1, "the key was still pressed");
+        var press = Assert.IsType<KeyboardPressOptions>(kbRec.Last("PressAsync")!.Args[1]);
+        Assert.Equal(300, press.Delay);
     }
 
     [Fact]

@@ -80,8 +80,9 @@ static void CmdInfo(string[] flags)
 {
     bool quick = flags.Contains("--quick") || flags.Contains("--no-launch");
     bool asJson = flags.Contains("--json");
+    string? proxy = GetFlagValue(flags, "--proxy");
 
-    var diag = Diagnostics.Collect(quick);
+    var diag = Diagnostics.Collect(quick, proxy);
 
     if (asJson)
     {
@@ -91,6 +92,16 @@ static void CmdInfo(string[] flags)
     {
         PrintDiagnostics(diag);
     }
+}
+
+static string? GetFlagValue(string[] flags, string name)
+{
+    string prefix = name + "=";
+    foreach (var f in flags)
+        if (f.StartsWith(prefix, StringComparison.Ordinal))
+            return f[prefix.Length..];
+    int i = Array.IndexOf(flags, name);
+    return i != -1 && i + 1 < flags.Length ? flags[i + 1] : null;
 }
 
 static void PrintDiagnostics(Dictionary<string, object?> diag)
@@ -224,14 +235,28 @@ static void PrintDiagnostics(Dictionary<string, object?> diag)
 
     if (lic.TryGetValue("sessions", out var sessionsObj) && sessionsObj is Dictionary<string, object?> sessions)
     {
-        var active = sessions["active"] as int?;
-        Console.WriteLine(active is null
-            ? "Sessions:  unavailable"
-            : $"Sessions:  {active} seat{(active == 1 ? "" : "s")} in use");
+        Console.WriteLine($"Sessions:  {Diagnostics.FormatSeats(sessions)}");
     }
 
     var geoip = (Dictionary<string, object?>)diag["geoip"]!;
-    Console.WriteLine($"GeoIP DB:  {(geoip["db_present"] is true ? "present" : "not downloaded (optional)")}");
+    bool hasResolved = geoip.TryGetValue("resolved", out var resolvedObj) && resolvedObj is Dictionary<string, object?>;
+    string dbLine = geoip["db_present"] is true ? "present" : "not downloaded (optional)";
+    if (!hasResolved)
+        dbLine += "  (pass --proxy <url> to resolve exit IP + timezone/locale)";
+    Console.WriteLine($"GeoIP DB:  {dbLine}");
+    if (hasResolved && resolvedObj is Dictionary<string, object?> resolved)
+    {
+        if (resolved.TryGetValue("error", out var errObj) && errObj is not null)
+        {
+            Console.WriteLine($"Exit IP:   (could not resolve — {errObj})");
+        }
+        else
+        {
+            Console.WriteLine($"Exit IP:   {resolved.GetValueOrDefault("exit_ip") ?? "(unknown)"}");
+            Console.WriteLine($"Timezone:  {resolved.GetValueOrDefault("timezone") ?? "(unknown)"}");
+            Console.WriteLine($"Locale:    {resolved.GetValueOrDefault("locale") ?? "(unknown)"}");
+        }
+    }
 
     if (diag.TryGetValue("modules", out var modulesObj) && modulesObj is Dictionary<string, object?> modules)
     {

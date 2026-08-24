@@ -60,6 +60,7 @@ function buildMockPage(overrides: Record<string, any> = {}): any {
   const page: any = {
     evaluate: overrides.evaluate ?? vi.fn(async () => false),
     addInitScript: vi.fn(async () => {}),
+    on: vi.fn(),
     mouse: {
       move: vi.fn(async () => {}),
       down: vi.fn(async () => {}),
@@ -1012,14 +1013,14 @@ describeIfSlow("stealth browser: no evaluate leak on click", () => {
     await page.evaluate(() => {
       (window as any).__evalLeaks = [];
       const origQS = document.querySelector.bind(document);
-      document.querySelector = function (sel: string) {
+      document.querySelector = ((sel: string) => {
         try { throw new Error(); } catch (e: any) {
           if (e.stack && e.stack.includes(':302:')) {
             (window as any).__evalLeaks.push(sel);
           }
         }
         return origQS(sel);
-      } as any;
+      }) as any;
     });
 
     await page.click('#searchInput');
@@ -1124,14 +1125,14 @@ describeIfSlow("stealth browser: full form no evaluate leak", () => {
       (window as any).__untrustedKeys = [];
 
       const origQS = document.querySelector.bind(document);
-      document.querySelector = function (sel: string) {
+      document.querySelector = ((sel: string) => {
         try { throw new Error(); } catch (e: any) {
           if (e.stack && e.stack.includes(':302:')) {
             (window as any).__evalLeaks.push(sel);
           }
         }
         return origQS(sel);
-      } as any;
+      }) as any;
 
       document.addEventListener('keydown', (e) => {
         if (!e.isTrusted) {

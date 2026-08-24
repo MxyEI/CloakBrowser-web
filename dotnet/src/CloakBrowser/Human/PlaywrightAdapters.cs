@@ -103,9 +103,31 @@ internal sealed class PlaywrightScrollPage : IRawScrollPage
         }
     }
 
+    public async Task<(double Y, double MaxY)?> GetScrollStateAsync()
+    {
+        try
+        {
+            var s = await _page.EvaluateAsync<ScrollDims>(
+                "() => { const e = document.scrollingElement || document.documentElement;" +
+                " return { y: window.scrollY, maxY: Math.max(0, e.scrollHeight - e.clientHeight) }; }")
+                .ConfigureAwait(false);
+            return (s.Y, s.MaxY);
+        }
+        catch (System.Exception)
+        {
+            return null;
+        }
+    }
+
     private struct WindowDims
     {
         public int Width { get; set; }
         public int Height { get; set; }
+    }
+
+    private struct ScrollDims
+    {
+        public double Y { get; set; }
+        public double MaxY { get; set; }
     }
 }

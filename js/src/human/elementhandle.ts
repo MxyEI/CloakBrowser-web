@@ -19,8 +19,8 @@
 import type { Page, Frame, ElementHandle, CDPSession } from 'playwright-core';
 import type { HumanConfig, HumanActionOptions } from './config.js';
 import { rand, randRange, sleep, mergeConfig } from './config.js';
-import { RawMouse, RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
-import { humanType } from './keyboard.js';
+import { type RawMouse, type RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
+import { humanType, pressWithDelay } from './keyboard.js';
 import { humanScrollIntoView } from './scroll.js';
 import {
   ensureActionableHandle, checkPointerEventsHandle,
@@ -29,6 +29,10 @@ import {
 
 // --- Platform-aware select-all shortcut ---
 const SELECT_ALL = process.platform === 'darwin' ? 'Meta+a' : 'Control+a';
+
+function reportHumanizeError(action: string, error: unknown): void {
+  console.error(`[cloakbrowser] ElementHandle ${action} failed:`, error);
+}
 
 
 // ============================================================================
@@ -42,14 +46,9 @@ async function isInputElementHandle(
   // Try CDP DOM.describeNode first (no main-world JS execution)
   if (stealth) {
     try {
-      const cdp: CDPSession = await stealth.getCdpSession();
-      // Playwright exposes the JSHandle's internal preview via _objectId or similar
-      // We need the remote object ID. Try to get it via internal API.
-      const impl = (el as any)._impl ?? (el as any)._object ?? el;
-      const guid = (impl as any)._guid;
-
-      // Use el.evaluate as a reliable fallback within stealth context
-      // Playwright doesn't expose remoteObject directly like Puppeteer
+      await stealth.getCdpSession();
+      // Playwright doesn't expose remoteObject directly like Puppeteer,
+      // so use el.evaluate as the fallback within the stealth context.
     } catch { /* fallthrough */ }
   }
 
@@ -100,7 +99,6 @@ export function patchSingleElementHandle(
   const origElHover = el.hover.bind(el);
   const origElType = el.type.bind(el);
   const origElFill = el.fill.bind(el);
-  const origElPress = el.press.bind(el);
   const origElSelectOption = el.selectOption.bind(el);
   const origElCheck = el.check.bind(el);
   const origElUncheck = el.uncheck.bind(el);
@@ -263,7 +261,11 @@ export function patchSingleElementHandle(
     await humanClick(raw, info.isInp, callCfg);
     await sleep(rand(100, 250));
     let cdpSession: CDPSession | null = null;
-    try { cdpSession = await stealth?.getCdpSession(); } catch {}
+    try {
+      cdpSession = await stealth?.getCdpSession();
+    } catch (error) {
+      reportHumanizeError('typing CDP setup', error);
+    }
     await humanType(page, rawKb, text, callCfg, cdpSession);
   };
 
@@ -288,16 +290,18 @@ export function patchSingleElementHandle(
     await originals.keyboardPress('Backspace');
     await sleep(rand(50, 150));
     let cdpSession: CDPSession | null = null;
-    try { cdpSession = await stealth?.getCdpSession(); } catch {}
+    try {
+      cdpSession = await stealth?.getCdpSession();
+    } catch (error) {
+      reportHumanizeError('fill CDP setup', error);
+    }
     await humanType(page, rawKb, value, callCfg, cdpSession);
   };
 
   // --- el.press() ---
   (el as any).press = async (key: string, options?: { delay?: number; noWaitAfter?: boolean; timeout?: number }) => {
     await sleep(rand(20, 60));
-    await originals.keyboardDown(key);
-    await sleep(randRange(cfg.key_hold));
-    await originals.keyboardUp(key);
+    await pressWithDelay(originals.keyboardPress, key, options, randRange(cfg.key_hold));
   };
 
   // --- el.selectOption() ---
@@ -334,7 +338,9 @@ export function patchSingleElementHandle(
     try {
       const checked = await el.isChecked();
       if (checked) return;
-    } catch {}
+    } catch (error) {
+      reportHumanizeError('checked-state read', error);
+    }
     const info = await moveToElement();
     if (!info) return origElCheck(options);
     if (!force) await checkPointerEventsHandle(el, cursor.x, cursor.y, Math.min(remainingMs(), 5000));
@@ -357,7 +363,9 @@ export function patchSingleElementHandle(
     try {
       const checked = await el.isChecked();
       if (!checked) return;
-    } catch {}
+    } catch (error) {
+      reportHumanizeError('unchecked-state read', error);
+    }
     const info = await moveToElement();
     if (!info) return origElUncheck(options);
     if (!force) await checkPointerEventsHandle(el, cursor.x, cursor.y, Math.min(remainingMs(), 5000));
@@ -381,7 +389,9 @@ export function patchSingleElementHandle(
       try {
         const current = await el.isChecked();
         if (current === checked) return;
-      } catch {}
+      } catch (error) {
+        reportHumanizeError('checked-state read', error);
+      }
       const info = await moveToElement();
       if (!info) return origElSetChecked(checked, options);
       if (!force) await checkPointerEventsHandle(el, cursor.x, cursor.y, Math.min(remainingMs(), 5000));

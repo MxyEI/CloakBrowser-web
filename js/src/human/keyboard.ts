@@ -7,8 +7,22 @@
  */
 
 import type { Page, CDPSession } from 'playwright-core';
-import { RawKeyboard } from './mouse.js';
-import { HumanConfig, rand, randRange, sleep } from './config.js';
+import type { RawKeyboard } from './mouse.js';
+import { type HumanConfig, randRange, sleep } from './config.js';
+
+export async function pressWithDelay<Key>(
+  press: (key: Key, options?: { delay?: number }) => Promise<void>,
+  key: Key,
+  options?: { delay?: number },
+  defaultDelay?: number,
+): Promise<void> {
+  const delay = options?.delay ?? defaultDelay;
+  if (delay === undefined) {
+    await press(key);
+    return;
+  }
+  await press(key, { delay });
+}
 
 const SHIFT_SYMBOLS = new Set([
   '@', '#', '!', '$', '%', '^', '&', '*', '(', ')',

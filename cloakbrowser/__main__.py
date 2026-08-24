@@ -238,8 +238,13 @@ def _effective_binary(entitled_pro: bool, quick: bool = False) -> dict:
     }
 
 
-def _collect_diagnostics(quick: bool) -> dict:
-    """Gather environment + binary diagnostics without triggering a download."""
+def _collect_diagnostics(quick: bool, proxy: str | None = None) -> dict:
+    """Gather environment + binary diagnostics.
+
+    Does not trigger a download unless ``proxy`` is given: with a proxy, the
+    exit IP + timezone + locale a launch would apply are resolved (which caches
+    the GeoIP DB if absent, exactly like a real launch).
+    """
     diag: dict = {}
 
     from ._version import __version__
@@ -260,11 +265,17 @@ def _collect_diagnostics(quick: bool) -> dict:
     # latest-version check below: --quick keeps `info` network-free, and a free
     # tier holds no seats. Never cached (a cached count is a wrong count).
     if entitled_pro and not quick:
-        from .license import get_active_session_count, resolve_license_key
+        from .license import get_session_seats, resolve_license_key
 
         key = resolve_license_key(None)
         if key:
-            license_info["sessions"] = {"active": get_active_session_count(key)}
+            seats = get_session_seats(key)
+            license_info["sessions"] = {
+                "active": seats.active,
+                "limit": seats.limit,
+                "state": seats.state,
+                "reason": seats.reason,
+            }
 
     from .config import get_platform_tag
 
@@ -317,6 +328,23 @@ def _collect_diagnostics(quick: bool) -> dict:
     db_path = _get_geoip_dir() / GEOIP_DB_FILENAME
     diag["geoip"] = {"db_present": db_path.exists(), "path": str(db_path)}
 
+    # Live resolution — only when a proxy is explicitly given. Mirrors launch():
+    # resolves the exit IP and, computing tz/locale, caches the DB if absent.
+    if proxy:
+        try:
+            from .geoip import resolve_proxy_geo_with_ip
+
+            tz, locale, exit_ip = resolve_proxy_geo_with_ip(proxy)
+            diag["geoip"]["resolved"] = {
+                "exit_ip": exit_ip,
+                "timezone": tz,
+                "locale": locale,
+            }
+        except ImportError:
+            diag["geoip"]["resolved"] = {"error": "geoip2 not installed"}
+        except Exception as exc:  # network/proxy failure — never crash `info`
+            diag["geoip"]["resolved"] = {"error": str(exc)}
+
     # Optional Python modules.
     diag["modules"] = {
         label: _module_available(module)
@@ -329,6 +357,36 @@ def _collect_diagnostics(quick: bool) -> dict:
     }
 
     return diag
+
+
+# Server error codes → the words a customer can act on. Anything unrecognised is
+# printed verbatim rather than swallowed, so a new server code still says something.
+_SEAT_DENIAL_REASONS = {
+    "invalid_key": "invalid key",
+    "license_inactive": "license inactive",
+    "rate_limited": "rate limited",
+}
+
+
+def _format_seats(sessions: dict) -> str:
+    """Render the seat lookup. Kept identical in the JS and .NET wrappers."""
+    state = sessions.get("state", "ok")
+    if state == "unreachable":
+        return "unavailable (cannot reach cloakbrowser.dev)"
+    if state == "denied":
+        reason = sessions.get("reason") or "refused"
+        return f"unavailable ({_SEAT_DENIAL_REASONS.get(reason, reason)})"
+    if state != "ok" or sessions.get("active") is None:
+        # The server is up and the key is fine — it just cannot count right now.
+        return "unavailable (server cannot report seats right now)"
+
+    active = sessions["active"]
+    limit = sessions.get("limit")
+    if limit is None:
+        # No cap to show (unlimited, unrecognised plan, or a server predating the
+        # field). Fall back to the bare count — never print "N/unknown".
+        return f"{active} seat{'' if active == 1 else 's'} in use"
+    return f"{active}/{limit} in use"
 
 
 def _print_diagnostics(diag: dict) -> None:
@@ -437,14 +495,21 @@ def _print_diagnostics(diag: dict) -> None:
         print(f"License:   {tier}")
 
     if "sessions" in lic:
-        active = lic["sessions"]["active"]
-        if active is None:
-            print("Sessions:  unavailable")
-        else:
-            print(f"Sessions:  {active} seat{'' if active == 1 else 's'} in use")
+        print(f"Sessions:  {_format_seats(lic['sessions'])}")
 
     geoip = diag["geoip"]
-    print(f"GeoIP DB:  {'present' if geoip['db_present'] else 'not downloaded (optional)'}")
+    db_line = "present" if geoip["db_present"] else "not downloaded (optional)"
+    resolved = geoip.get("resolved")
+    if resolved is None:
+        db_line += "  (pass --proxy <url> to resolve exit IP + timezone/locale)"
+    print(f"GeoIP DB:  {db_line}")
+    if resolved is not None:
+        if resolved.get("error"):
+            print(f"Exit IP:   (could not resolve — {resolved['error']})")
+        else:
+            print(f"Exit IP:   {resolved.get('exit_ip') or '(unknown)'}")
+            print(f"Timezone:  {resolved.get('timezone') or '(unknown)'}")
+            print(f"Locale:    {resolved.get('locale') or '(unknown)'}")
 
     print("Modules:")
     for label, available in diag["modules"].items():
@@ -453,7 +518,7 @@ def _print_diagnostics(diag: dict) -> None:
 
 def cmd_info(args: argparse.Namespace) -> None:
     quick = getattr(args, "quick", False)
-    diag = _collect_diagnostics(quick=quick)
+    diag = _collect_diagnostics(quick=quick, proxy=getattr(args, "proxy", None))
     if getattr(args, "json", False):
         import json
 
@@ -612,6 +677,14 @@ def main() -> None:
             help="Skip the binary launch test (faster; the license is still validated)",
         )
         p.add_argument("--json", action="store_true", help="Emit diagnostics as JSON")
+        p.add_argument(
+            "--proxy",
+            metavar="URL",
+            help=(
+                "Resolve the exit IP, timezone, and locale a launch would apply "
+                "through this proxy (downloads the GeoIP DB if not cached)"
+            ),
+        )
 
     _add_info_flags(sub.add_parser("info", help="Environment + binary diagnostics"))
     _add_info_flags(sub.add_parser("doctor", help="Alias for info"))

@@ -25,7 +25,8 @@ import {
   WRAPPER_VERSION,
 } from "./config.js";
 import { countFontsPresent, WINDOWS_FONT_TELLS, OFFICE_FONT_TELLS } from "./fonts.js";
-import { resolveLicenseKey, validateLicense, getProLatestRelease, getActiveSessionCount, type LicenseInfo } from "./license.js";
+import { resolveProxyGeo } from "./geoip.js";
+import { resolveLicenseKey, validateLicense, getProLatestRelease, getSessionSeats, type LicenseInfo } from "./license.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
@@ -209,7 +210,10 @@ async function effectiveBinary(
   };
 }
 
-export async function collectDiagnostics(quick: boolean): Promise<Record<string, unknown>> {
+export async function collectDiagnostics(
+  quick: boolean,
+  proxy?: string
+): Promise<Record<string, unknown>> {
   const diag: Record<string, any> = {};
 
   diag.environment = {
@@ -229,7 +233,13 @@ export async function collectDiagnostics(quick: boolean): Promise<Record<string,
   if (entitledPro && !quick) {
     const key = resolveLicenseKey();
     if (key) {
-      license.sessions = { active: await getActiveSessionCount(key) };
+      const seats = await getSessionSeats(key);
+      license.sessions = {
+        active: seats.active,
+        limit: seats.limit,
+        state: seats.state,
+        reason: seats.reason,
+      };
     }
   }
 
@@ -277,6 +287,17 @@ export async function collectDiagnostics(quick: boolean): Promise<Record<string,
   const dbPath = path.join(getCacheDir(), "geoip", "GeoLite2-City.mmdb");
   diag.geoip = { db_present: fs.existsSync(dbPath), path: dbPath };
 
+  // Live resolution — only when a proxy is explicitly given. Mirrors launch():
+  // resolves the exit IP and, computing tz/locale, caches the DB if absent.
+  if (proxy) {
+    try {
+      const { timezone, locale, exitIp } = await resolveProxyGeo(proxy);
+      diag.geoip.resolved = { exit_ip: exitIp, timezone, locale };
+    } catch (err) {
+      diag.geoip.resolved = { error: (err as Error).message };
+    }
+  }
+
   // Optional peer deps.
   diag.modules = {
     "playwright-core": moduleAvailable("playwright-core"),
@@ -285,6 +306,43 @@ export async function collectDiagnostics(quick: boolean): Promise<Record<string,
   };
 
   return diag;
+}
+
+interface SeatSection {
+  active?: number | null;
+  limit?: number | null;
+  state?: string;
+  reason?: string | null;
+}
+
+// Server error codes → the words a customer can act on. Anything unrecognised is
+// printed verbatim rather than swallowed, so a new server code still says something.
+const SEAT_DENIAL_REASONS: Record<string, string> = {
+  invalid_key: "invalid key",
+  license_inactive: "license inactive",
+  rate_limited: "rate limited",
+};
+
+/** Render the seat lookup. Kept identical in the Python and .NET wrappers. */
+export function formatSeats(sessions: SeatSection): string {
+  const state = sessions.state ?? "ok";
+  if (state === "unreachable") return "unavailable (cannot reach cloakbrowser.dev)";
+  if (state === "denied") {
+    const reason = sessions.reason || "refused";
+    return `unavailable (${SEAT_DENIAL_REASONS[reason] ?? reason})`;
+  }
+  if (state !== "ok" || typeof sessions.active !== "number") {
+    // The server is up and the key is fine — it just cannot count right now.
+    return "unavailable (server cannot report seats right now)";
+  }
+
+  const active = sessions.active;
+  if (typeof sessions.limit !== "number") {
+    // No cap to show (unlimited, unrecognised plan, or a server predating the
+    // field). Fall back to the bare count — never print "N/unknown".
+    return `${active} seat${active === 1 ? "" : "s"} in use`;
+  }
+  return `${active}/${sessions.limit} in use`;
 }
 
 function printDiagnostics(diag: Record<string, any>): void {
@@ -397,15 +455,24 @@ function printDiagnostics(diag: Record<string, any>): void {
   }
 
   if (lic.sessions) {
-    const active = (lic.sessions as { active: number | null }).active;
-    console.log(
-      active === null
-        ? "Sessions:  unavailable"
-        : `Sessions:  ${active} seat${active === 1 ? "" : "s"} in use`
-    );
+    console.log(`Sessions:  ${formatSeats(lic.sessions as SeatSection)}`);
   }
 
-  console.log(`GeoIP DB:  ${diag.geoip.db_present ? "present" : "not downloaded (optional)"}`);
+  const resolved = diag.geoip.resolved;
+  let dbLine = diag.geoip.db_present ? "present" : "not downloaded (optional)";
+  if (resolved === undefined) {
+    dbLine += "  (pass --proxy <url> to resolve exit IP + timezone/locale)";
+  }
+  console.log(`GeoIP DB:  ${dbLine}`);
+  if (resolved !== undefined) {
+    if (resolved.error) {
+      console.log(`Exit IP:   (could not resolve — ${resolved.error})`);
+    } else {
+      console.log(`Exit IP:   ${resolved.exit_ip ?? "(unknown)"}`);
+      console.log(`Timezone:  ${resolved.timezone ?? "(unknown)"}`);
+      console.log(`Locale:    ${resolved.locale ?? "(unknown)"}`);
+    }
+  }
 
   console.log("Modules:");
   for (const [label, available] of Object.entries(diag.modules)) {
@@ -413,10 +480,19 @@ function printDiagnostics(diag: Record<string, any>): void {
   }
 }
 
+function getFlagValue(args: string[], flag: string): string | undefined {
+  const eq = args.find((a) => a.startsWith(`${flag}=`));
+  if (eq) return eq.slice(flag.length + 1);
+  const i = args.indexOf(flag);
+  if (i !== -1 && i + 1 < args.length) return args[i + 1];
+  return undefined;
+}
+
 async function cmdInfo(args: string[]): Promise<void> {
   const quick = args.includes("--quick") || args.includes("--no-launch");
   const asJson = args.includes("--json");
-  const diag = await collectDiagnostics(quick);
+  const proxy = getFlagValue(args, "--proxy");
+  const diag = await collectDiagnostics(quick, proxy);
   if (asJson) {
     console.log(JSON.stringify(diag, null, 2));
   } else {

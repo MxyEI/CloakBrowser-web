@@ -264,9 +264,15 @@ CloakBrowser binary and the selected environment configuration.
 
 ## Verification Record
 
+- Upstream baseline synchronized through `CloakHQ/CloakBrowser` commit
+  `b90c670` (`v0.5.8` wrapper plus the Chromium 151 banner update) while
+  retaining the local Manager, Cloud control plane, Agent, and Workspace.
 - Cloud-focused suite: 49 passed.
-- Full non-slow repository suite: 862 passed, 40 deselected.
-- Python compile, JavaScript syntax, and `git diff --check` passed.
+- Full non-slow repository suite: 944 passed, 42 deselected.
+- JavaScript suite: 596 passed, 11 skipped; TypeScript typecheck and build
+  passed. The local machine did not have the .NET SDK, so .NET tests were not
+  run during this synchronization.
+- Python compile, Wheel build, JavaScript syntax, and `git diff --check` passed.
 - Cloud-console desktop and 390 px Playwright checks passed without page errors
   or body overflow. A new Workspace screenshot run was unavailable because the
   in-app browser had no active browser instance.

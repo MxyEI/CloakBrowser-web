@@ -10,7 +10,7 @@ namespace CloakBrowser;
 /// </summary>
 internal static class Diagnostics
 {
-    internal static Dictionary<string, object?> Collect(bool quick)
+    internal static Dictionary<string, object?> Collect(bool quick, string? proxy = null)
     {
         var diag = new Dictionary<string, object?>();
 
@@ -35,9 +35,13 @@ internal static class Diagnostics
             string? sessionKey = License.ResolveLicenseKey();
             if (!string.IsNullOrEmpty(sessionKey))
             {
+                var seats = License.GetSessionSeats(sessionKey!);
                 license["sessions"] = new Dictionary<string, object?>
                 {
-                    ["active"] = License.GetActiveSessionCount(sessionKey!),
+                    ["active"] = seats.Active,
+                    ["limit"] = seats.Limit,
+                    ["state"] = seats.State,
+                    ["reason"] = seats.Reason,
                 };
             }
         }
@@ -94,7 +98,29 @@ internal static class Diagnostics
 
         // GeoIP DB — presence only, never downloads.
         string dbPath = Path.Combine(Config.GetCacheDir(), "geoip", "GeoLite2-City.mmdb");
-        diag["geoip"] = new Dictionary<string, object?> { ["db_present"] = File.Exists(dbPath), ["path"] = dbPath };
+        var geoip = new Dictionary<string, object?> { ["db_present"] = File.Exists(dbPath), ["path"] = dbPath };
+        diag["geoip"] = geoip;
+
+        // Live resolution — only when a proxy is explicitly given. Mirrors
+        // LaunchAsync: resolves the exit IP and, computing tz/locale, caches the
+        // DB if absent. Never crashes `info` — failures land in ["error"].
+        if (!string.IsNullOrEmpty(proxy))
+        {
+            try
+            {
+                var (tz, locale, exitIp) = GeoIp.ResolveProxyGeoWithIpAsync(proxy).GetAwaiter().GetResult();
+                geoip["resolved"] = new Dictionary<string, object?>
+                {
+                    ["exit_ip"] = exitIp,
+                    ["timezone"] = tz,
+                    ["locale"] = locale,
+                };
+            }
+            catch (Exception ex)
+            {
+                geoip["resolved"] = new Dictionary<string, object?> { ["error"] = ex.Message };
+            }
+        }
 
         // Dependency assemblies — mirrors the Python/JS modules section. These are
         // hard NuGet references, so "missing" here means a broken deployment.
@@ -293,5 +319,44 @@ internal static class Diagnostics
         }
         catch { /* best-effort */ }
         return missing;
+    }
+
+    // Server error codes -> the words a customer can act on. Anything unrecognised is
+    // printed verbatim rather than swallowed, so a new server code still says something.
+    private static string HumaniseSeatDenial(string reason) => reason switch
+    {
+        "invalid_key" => "invalid key",
+        "license_inactive" => "license inactive",
+        "rate_limited" => "rate limited",
+        _ => reason,
+    };
+
+    /// <summary>
+    /// Render the seat lookup for the CLI's "Sessions:" line. Kept byte-identical to
+    /// the Python (_format_seats) and JS (formatSeats) renderers.
+    /// </summary>
+    /// <remarks>
+    /// Lives here rather than in the CLI because Program.cs uses top-level statements,
+    /// whose local functions cannot be reached from the test assembly.
+    /// </remarks>
+    internal static string FormatSeats(Dictionary<string, object?> sessions)
+    {
+        var state = sessions.GetValueOrDefault("state") as string ?? "ok";
+        if (state == "unreachable")
+            return "unavailable (cannot reach cloakbrowser.dev)";
+        if (state == "denied")
+        {
+            var reason = sessions.GetValueOrDefault("reason") as string;
+            return $"unavailable ({HumaniseSeatDenial(string.IsNullOrEmpty(reason) ? "refused" : reason)})";
+        }
+        if (state != "ok" || sessions.GetValueOrDefault("active") is not int active)
+            // The server is up and the key is fine - it just cannot count right now.
+            return "unavailable (server cannot report seats right now)";
+
+        if (sessions.GetValueOrDefault("limit") is not int limit)
+            // No cap to show (unlimited, unrecognised plan, or a server predating the
+            // field). Fall back to the bare count - never print "N/unknown".
+            return $"{active} seat{(active == 1 ? "" : "s")} in use";
+        return $"{active}/{limit} in use";
     }
 }

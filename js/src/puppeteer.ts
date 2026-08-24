@@ -17,7 +17,13 @@ import { maybeWarnWindowsFonts } from "./fonts.js";
 import { ensureBinary } from "./download.js";
 import { isSocksProxy, normalizeHttpStringUrl, parseProxyUrl, reconstructHttpUrl, resolveProxyConfig } from "./proxy.js";
 import { maybeResolveGeoip, resolveWebrtcArgs, appendWebrtcExitIp } from "./geoip.js";
-import { buildLaunchEnv, licenseErrorFrom } from "./license.js";
+import {
+  buildLaunchEnv,
+  installLicenseGuard,
+  licenseErrorFrom,
+  mintDenialFile,
+  resolveLicenseKey,
+} from "./license.js";
 import { seedWidevineHint } from "./widevine.js";
 
 export { CloakBrowserLicenseError } from "./license.js";
@@ -178,10 +184,12 @@ export async function launch(options: LaunchOptions = {}): Promise<Browser> {
   const proxyAuth = resolveProxy(options, args);
 
   // Resolve env for the browser process (license key injection, if needed).
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
   const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
   const launchEnv = buildLaunchEnv(
     options.licenseKey,
     userEnv as Record<string, string | undefined> | undefined,
+    denialPath,
   );
   const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
@@ -202,6 +210,14 @@ export async function launch(options: LaunchOptions = {}): Promise<Browser> {
     throw err;
   }
 
+  // Convert a post-handshake license denial into a clear error on first use.
+  // Installed before applyPostLaunch so it sits closest to the real call.
+  if (denialPath) {
+    // Guarding the browser deeply covers newPage AND the context factories
+    // (createBrowserContext) and every page/context they hand back — so a user
+    // who creates their own context is covered too.
+    installLicenseGuard(browser, denialPath);
+  }
   await applyPostLaunch(browser, options, proxyAuth);
   return browser;
 }
@@ -234,10 +250,12 @@ export async function launchPersistentContext(
   seedWidevineHint(options.userDataDir, binaryPath);
 
   // Resolve env for the browser process (license key injection, if needed).
+  const denialPath = resolveLicenseKey(options.licenseKey) ? mintDenialFile() : undefined;
   const { env: userEnv, ...restLaunchOptions } = options.launchOptions ?? {};
   const launchEnv = buildLaunchEnv(
     options.licenseKey,
     userEnv as Record<string, string | undefined> | undefined,
+    denialPath,
   );
   const envResult = launchEnv !== undefined ? { env: launchEnv } : {};
 
@@ -259,6 +277,16 @@ export async function launchPersistentContext(
     throw err;
   }
 
+  // Guard the browser deeply for a post-handshake denial (see launch()).
+  if (denialPath) {
+    installLicenseGuard(browser, denialPath);
+    // A persistent browser arrives with a page already open, so the user drives
+    // pages()[0] directly and never calls newPage. Guard those existing pages
+    // too. Mirrors Python / Playwright wrapper.
+    for (const pg of await browser.pages()) {
+      installLicenseGuard(pg, denialPath);
+    }
+  }
   await applyPostLaunch(browser, options, proxyAuth);
   return browser;
 }

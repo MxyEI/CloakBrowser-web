@@ -52,6 +52,7 @@ function buildMockPage(overrides: Record<string, any> = {}): any {
 
   const page: any = {
     evaluate: overrides.evaluate ?? vi.fn(async () => false),
+    on: vi.fn(),
     mouse: {
       move: vi.fn(async () => {}),
       down: vi.fn(async () => {}),
@@ -1518,6 +1519,44 @@ describe("Puppeteer: frame-level patching", () => {
     expect((childFrame as any)._humanPatched).toBe(true);
   });
 
+  it("dynamically attached frames are patched once", async () => {
+    const { patchPage } = await import("../src/human-puppeteer/index.js");
+
+    const page = buildMockPage();
+    const cfg = resolveConfig("default");
+    const cursor = { x: 0, y: 0, initialized: false };
+    patchPage(page as any, cfg, cursor as any);
+    await page.goto("https://example.com");
+
+    // Two listeners are wired once: frameattached (patch dynamic frames) and
+    // framenavigated (invalidate the isolated world — #507).
+    expect(page.on).toHaveBeenCalledTimes(2);
+    const attachedCall = page.on.mock.calls.find((c: any[]) => c[0] === "frameattached");
+    expect(attachedCall).toBeDefined();
+    const handler = attachedCall[1];
+
+    const attachedFrame: any = {
+      click: vi.fn(async () => {}),
+      hover: vi.fn(async () => {}),
+      type: vi.fn(async () => {}),
+      select: vi.fn(async () => []),
+      focus: vi.fn(async () => {}),
+      tap: vi.fn(async () => {}),
+      $: vi.fn(async () => null),
+      $$: vi.fn(async () => []),
+      waitForSelector: vi.fn(async () => null),
+      childFrames: vi.fn(() => []),
+    };
+    const originalClick = attachedFrame.click;
+    handler(attachedFrame);
+    const patchedClick = attachedFrame.click;
+    handler(attachedFrame);
+
+    expect(attachedFrame._humanPatched).toBe(true);
+    expect(patchedClick).not.toBe(originalClick);
+    expect(attachedFrame.click).toBe(patchedClick);
+  });
+
   it("frame.focus is patched to delegate to page.focus", async () => {
     const { patchPage } = await import("../src/human-puppeteer/index.js");
 
@@ -1876,6 +1915,43 @@ describe("Puppeteer: cursor initialization", () => {
 
 
 // =========================================================================
+// Press delay forwarding
+// =========================================================================
+describe("Puppeteer: press delay forwarding", () => {
+  it("keyboard.press forwards delay to the original press", async () => {
+    const { patchPage } = await import("../src/human-puppeteer/index.js");
+    const page = buildMockPage();
+    const originalKeyboardPress = page.keyboard.press;
+
+    patchPage(
+      page,
+      resolveConfig("default", { idle_between_actions: false }),
+      { x: 50, y: 50, initialized: true },
+    );
+    await page.keyboard.press("Control+V", { delay: 300 });
+
+    expect(originalKeyboardPress).toHaveBeenCalledWith("Control+V", { delay: 300 });
+  });
+
+  it("ElementHandle.press forwards delay to the original keyboard press", async () => {
+    const { patchPage } = await import("../src/human-puppeteer/index.js");
+    const element = buildMockElementHandle();
+    const page = buildMockPage({ $: vi.fn(async () => element) });
+    const originalKeyboardPress = page.keyboard.press;
+
+    patchPage(
+      page,
+      resolveConfig("default", { idle_between_actions: false }),
+      { x: 50, y: 50, initialized: true },
+    );
+    const patchedElement = await page.$("#field");
+    await patchedElement.press("Control+V", { delay: 300 });
+
+    expect(originalKeyboardPress).toHaveBeenCalledWith("Control+V", { delay: 300 });
+  });
+});
+
+// =========================================================================
 // Page-level method replacement verification
 // =========================================================================
 describe("Puppeteer: all page methods are replaced", () => {
@@ -1943,14 +2019,14 @@ describeIfSlow("Puppeteer stealth browser: no evaluate leak on click", () => {
     await page.evaluate(() => {
       (window as any).__evalLeaks = [];
       const origQS = document.querySelector.bind(document);
-      document.querySelector = function (sel: string) {
+      document.querySelector = ((sel: string) => {
         try { throw new Error(); } catch (e: any) {
           if (e.stack && e.stack.includes(':302:')) {
             (window as any).__evalLeaks.push(sel);
           }
         }
         return origQS(sel);
-      } as any;
+      }) as any;
     });
 
     await page.click('#searchInput');

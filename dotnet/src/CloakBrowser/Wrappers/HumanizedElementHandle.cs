@@ -109,7 +109,7 @@ public sealed partial class HumanizedElementHandle : IElementHandle
     {
         await _inner.FocusAsync().ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(50, 150)).ConfigureAwait(false);
-        await _cursor.PressAsync(key).ConfigureAwait(false);
+        await _cursor.PressAsync(key, OptionReader.Delay(options)).ConfigureAwait(false);
     }
 
     public async Task CheckAsync(ElementHandleCheckOptions? options = null)

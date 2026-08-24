@@ -10,7 +10,7 @@ import pytest
 
 import cloakbrowser.__main__
 from cloakbrowser.__main__ import _binary_version, cmd_info
-from cloakbrowser.license import LicenseInfo, ProReleaseInfo
+from cloakbrowser.license import LicenseInfo, ProReleaseInfo, SessionSeats
 
 
 def _run(args, *, key=None, license_info=None, sessions=None):
@@ -18,8 +18,9 @@ def _run(args, *, key=None, license_info=None, sessions=None):
 
     key=None  -> no license -> free binary.
     key set   -> validate_license returns license_info (entitled to Pro if valid).
-    sessions  -> what the seat-count lookup reports (it is mocked out, so a
-                 non-quick Pro run never reaches the network).
+    sessions  -> the SessionSeats the seat lookup reports (it is mocked out, so a
+                 non-quick Pro run never reaches the network). None defaults to a
+                 server-cannot-count result, which keeps unrelated tests offline.
 
     Returns (download_free_mock, download_pro_mock, session_count_mock) so callers
     can assert the command never triggers a binary download or an unwanted lookup.
@@ -28,7 +29,8 @@ def _run(args, *, key=None, license_info=None, sessions=None):
         patch("cloakbrowser.license.resolve_license_key", return_value=key),
         patch("cloakbrowser.license.validate_license", return_value=license_info),
         patch(
-            "cloakbrowser.license.get_active_session_count", return_value=sessions
+            "cloakbrowser.license.get_session_seats",
+            return_value=sessions if sessions is not None else SessionSeats(state="unknown"),
         ) as mock_sessions,
         patch("cloakbrowser.download._download_and_extract") as mock_dl_free,
         patch("cloakbrowser.download._download_pro_binary") as mock_dl_pro,
@@ -53,6 +55,54 @@ def test_info_quick_skips_launch(capsys):
     _run(Namespace(quick=True, json=False))
     out = capsys.readouterr().out
     assert "skipped (--quick)" in out
+
+
+def test_info_without_proxy_shows_hint_and_never_resolves(capsys):
+    with patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip") as resolver:
+        _run(Namespace(quick=True, json=False))
+    resolver.assert_not_called()
+    out = capsys.readouterr().out
+    assert "pass --proxy" in out
+    assert "Exit IP:" not in out
+
+
+def test_info_proxy_resolves_and_prints_exit_ip(capsys):
+    with patch(
+        "cloakbrowser.geoip.resolve_proxy_geo_with_ip",
+        return_value=("Europe/Berlin", "de-DE", "203.0.113.9"),
+    ) as resolver:
+        _run(Namespace(quick=True, json=False, proxy="http://p:8080"))
+    resolver.assert_called_once_with("http://p:8080")
+    out = capsys.readouterr().out
+    assert "Exit IP:   203.0.113.9" in out
+    assert "Timezone:  Europe/Berlin" in out
+    assert "Locale:    de-DE" in out
+    assert "pass --proxy" not in out  # hint suppressed once resolved
+
+
+def test_info_proxy_json_includes_resolved(capsys):
+    with patch(
+        "cloakbrowser.geoip.resolve_proxy_geo_with_ip",
+        return_value=("Europe/Berlin", "de-DE", "203.0.113.9"),
+    ):
+        _run(Namespace(quick=True, json=True, proxy="http://p:8080"))
+    data = json.loads(capsys.readouterr().out)
+    assert data["geoip"]["resolved"] == {
+        "exit_ip": "203.0.113.9",
+        "timezone": "Europe/Berlin",
+        "locale": "de-DE",
+    }
+
+
+def test_info_proxy_resolution_failure_is_reported_not_fatal(capsys):
+    with patch(
+        "cloakbrowser.geoip.resolve_proxy_geo_with_ip",
+        side_effect=RuntimeError("proxy refused"),
+    ):
+        _run(Namespace(quick=True, json=False, proxy="http://p:8080"))
+    out = capsys.readouterr().out
+    assert "could not resolve" in out
+    assert "proxy refused" in out
 
 
 def test_keyless_reports_free_binary(capsys):
@@ -122,35 +172,92 @@ def test_invalid_key_falls_back_to_free(capsys):
 _PRO = LicenseInfo(valid=True, plan="business", expires=None)
 
 
-def test_pro_reports_seats_in_use(capsys):
-    _run(Namespace(quick=False, json=True), key="cb_test", license_info=_PRO, sessions=3)
+def _seats(args_json=False, **seat_kwargs):
+    """Render the Sessions line for one SessionSeats result."""
+    return _run(
+        Namespace(quick=False, json=args_json),
+        key="cb_test",
+        license_info=_PRO,
+        sessions=SessionSeats(**seat_kwargs),
+    )
+
+
+def test_pro_reports_seats_and_limit_in_json(capsys):
+    _seats(args_json=True, active=8, limit=2000, state="ok")
     data = json.loads(capsys.readouterr().out)
-    assert data["license"]["sessions"] == {"active": 3}
+    assert data["license"]["sessions"] == {
+        "active": 8, "limit": 2000, "state": "ok", "reason": None,
+    }
 
 
-def test_seat_line_printed_in_text_mode(capsys):
-    _run(Namespace(quick=False, json=False), key="cb_test", license_info=_PRO, sessions=3)
-    assert "Sessions:  3 seats in use" in capsys.readouterr().out
+def test_seat_line_shows_used_over_limit(capsys):
+    """The point of the change: a scale-plan customer can see they are nowhere near
+    the ceiling (or right on it) instead of reading a bare number."""
+    _seats(active=8, limit=2000, state="ok")
+    assert "Sessions:  8/2000 in use" in capsys.readouterr().out
 
 
-def test_seat_line_is_singular_for_one(capsys):
-    _run(Namespace(quick=False, json=False), key="cb_test", license_info=_PRO, sessions=1)
-    assert "Sessions:  1 seat in use" in capsys.readouterr().out
-
-
-def test_zero_seats_reads_as_none_in_use_not_unavailable(capsys):
-    """0 is a real answer ("nothing running"); only an unknown prints unavailable."""
-    _run(Namespace(quick=False, json=False), key="cb_test", license_info=_PRO, sessions=0)
+def test_seat_line_falls_back_when_the_server_sends_no_limit(capsys):
+    """Older server, unlimited licence, or an unrecognised plan. Print the count we do
+    have rather than "8/unknown"."""
+    _seats(active=8, limit=None, state="ok")
     out = capsys.readouterr().out
-    assert "Sessions:  0 seats in use" in out
+    assert "Sessions:  8 seats in use" in out
     assert "unavailable" not in out
 
 
-def test_unknown_count_prints_unavailable(capsys):
-    """Server unreachable, or the server itself reported the count as unknown
-    (leaseless mode) -> "unavailable", never a made-up number."""
-    _run(Namespace(quick=False, json=False), key="cb_test", license_info=_PRO, sessions=None)
-    assert "Sessions:  unavailable" in capsys.readouterr().out
+def test_seat_fallback_is_singular_for_one(capsys):
+    _seats(active=1, limit=None, state="ok")
+    assert "Sessions:  1 seat in use" in capsys.readouterr().out
+
+
+def test_one_of_one_seat_shows_the_limit(capsys):
+    """A free key holds exactly one seat — the cohort most likely to hit its cap."""
+    _seats(active=1, limit=1, state="ok")
+    assert "Sessions:  1/1 in use" in capsys.readouterr().out
+
+
+def test_zero_seats_reads_as_a_real_answer_not_unavailable(capsys):
+    """0 is a real answer ("nothing running"); only an unknown prints unavailable."""
+    _seats(active=0, limit=5, state="ok")
+    out = capsys.readouterr().out
+    assert "Sessions:  0/5 in use" in out
+    assert "unavailable" not in out
+
+
+def test_unreachable_server_says_so(capsys):
+    _seats(state="unreachable")
+    assert "Sessions:  unavailable (cannot reach cloakbrowser.dev)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "code,shown",
+    [
+        ("license_inactive", "license inactive"),
+        ("invalid_key", "invalid key"),
+        ("rate_limited", "rate limited"),
+    ],
+)
+def test_denial_reasons_are_spelled_out(capsys, code, shown):
+    """These four used to be one string. A dead key and a healthy key behind a
+    degraded backend must not read identically."""
+    _seats(state="denied", reason=code)
+    assert f"Sessions:  unavailable ({shown})" in capsys.readouterr().out
+
+
+def test_unrecognised_denial_reason_is_passed_through(capsys):
+    """A server code we have no wording for still says something actionable."""
+    _seats(state="denied", reason="some_new_code")
+    assert "Sessions:  unavailable (some_new_code)" in capsys.readouterr().out
+
+
+def test_server_cannot_count_is_not_an_error(capsys):
+    """Leaseless mode / seat store down: the customer's key is fine and there is
+    nothing for them to do. Must not read like a licence problem."""
+    _seats(state="unknown")
+    out = capsys.readouterr().out
+    assert "Sessions:  unavailable (server cannot report seats right now)" in out
+    assert "invalid" not in out
 
 
 def test_quick_skips_the_seat_lookup(capsys):

@@ -23,15 +23,14 @@
  */
 
 import type { Browser, BrowserContext, Page, Frame, CDPSession } from 'playwright-core';
-import { HumanConfig, HumanActionOptions, resolveConfig, mergeConfig, rand, randRange, sleep } from './config.js';
-import { RawMouse, RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
-import { humanType } from './keyboard.js';
-import { scrollToElement, humanScrollIntoView } from './scroll.js';
-import { patchPageElementHandles, patchFrameElementHandles, patchSingleElementHandle } from './elementhandle.js';
+import { type HumanConfig, type HumanActionOptions, mergeConfig, rand, randRange, sleep } from './config.js';
+import { type RawMouse, type RawKeyboard, humanMove, humanClick, clickTarget, humanIdle } from './mouse.js';
+import { humanType, pressWithDelay } from './keyboard.js';
+import { scrollToElement } from './scroll.js';
+import { patchPageElementHandles, patchFrameElementHandles } from './elementhandle.js';
 import {
   ensureActionable, ensureStable, checkPointerEvents,
   CHECKS_CLICK, CHECKS_HOVER, CHECKS_INPUT, CHECKS_FOCUS, CHECKS_CHECK,
-  type CheckName,
 } from './actionability.js';
 
 export { HumanConfig, resolveConfig, mergeConfig } from './config.js';
@@ -241,7 +240,9 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     fill: page.fill.bind(page),
     check: page.check.bind(page),
     uncheck: page.uncheck.bind(page),
-    selectOption: page.selectOption.bind(page),
+    // Bind to the main frame, not the page: page.selectOption re-dispatches to the
+    // patched main-frame method, so binding to the page would loop forever.
+    selectOption: page.mainFrame().selectOption.bind(page.mainFrame()),
     press: page.press.bind(page),
     goto: page.goto.bind(page),
     isChecked: page.isChecked.bind(page),
@@ -271,7 +272,9 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     if (!cdpSession) {
       try {
         cdpSession = await stealth.getCdpSession();
-      } catch {}
+      } catch (error) {
+        console.error('[cloakbrowser] Failed to create humanize CDP session:', error);
+      }
     }
     return cdpSession;
   };
@@ -334,7 +337,13 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     let finalBox = box;
     if (!force && didScroll) {
       await ensureStable(page, selector, remainingMs());
-      finalBox = await page.locator(selector).first().boundingBox({ timeout: Math.max(1, remainingMs()) }) ?? box;
+      // Waiting for the reflow to settle can push the element back out of view,
+      // and scrolling once before the wait is not enough: the click coords would
+      // land outside the viewport and hit nothing (#329).
+      const rescrolled = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
+      finalBox = rescrolled.box;
+      cursor.x = rescrolled.cursorX;
+      cursor.y = rescrolled.cursorY;
     }
     const target = clickTarget(finalBox, isInput, callCfg);
     if (!force) {
@@ -366,7 +375,13 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     let finalBox = box;
     if (!force && didScroll) {
       await ensureStable(page, selector, remainingMs());
-      finalBox = await page.locator(selector).first().boundingBox({ timeout: Math.max(1, remainingMs()) }) ?? box;
+      // Waiting for the reflow to settle can push the element back out of view,
+      // and scrolling once before the wait is not enough: the click coords would
+      // land outside the viewport and hit nothing (#329).
+      const rescrolled = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
+      finalBox = rescrolled.box;
+      cursor.x = rescrolled.cursorX;
+      cursor.y = rescrolled.cursorY;
     }
     const target = clickTarget(finalBox, isInput, callCfg);
     if (!force) {
@@ -400,7 +415,13 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     let finalBox = box;
     if (!force && didScroll) {
       await ensureStable(page, selector, remainingMs());
-      finalBox = await page.locator(selector).first().boundingBox({ timeout: Math.max(1, remainingMs()) }) ?? box;
+      // Waiting for the reflow to settle can push the element back out of view,
+      // and scrolling once before the wait is not enough: the click coords would
+      // land outside the viewport and hit nothing (#329).
+      const rescrolled = await scrollToElement(page, raw, selector, cursor.x, cursor.y, callCfg, remainingMs());
+      finalBox = rescrolled.box;
+      cursor.x = rescrolled.cursorX;
+      cursor.y = rescrolled.cursorY;
     }
     const target = clickTarget(finalBox, false, callCfg);
     if (!force) {
@@ -525,7 +546,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
       await humanClickFn(selector, { _skipChecks: true, timeout: remainingMs(), force, human_config: options?.human_config } as any);
     }
     await sleep(rand(50, 150));
-    await originals.keyboardPress(key);
+    await pressWithDelay(originals.keyboardPress, key, options);
   };
 
   // --- pressSequentially ---
@@ -566,7 +587,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   (page as any).clear = humanClearFn;
 
   // --- mouse patches ---
-  page.mouse.move = async (x: number, y: number, options?: {
+  page.mouse.move = async (x: number, y: number, _options?: {
     steps?: number;
   }) => {
     await ensureCursorInit();
@@ -575,7 +596,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
     cursor.y = y;
   };
 
-  page.mouse.click = async (x: number, y: number, options?: {
+  page.mouse.click = async (x: number, y: number, _options?: {
     button?: 'left' | 'right' | 'middle';
     clickCount?: number;
     delay?: number;
@@ -588,7 +609,7 @@ function patchPage(page: Page, cfg: HumanConfig, cursor: CursorState): void {
   };
 
   // --- keyboard patches ---
-  page.keyboard.type = async (text: string, options?: { delay?: number }) => {
+  page.keyboard.type = async (text: string, _options?: { delay?: number }) => {
     const cdp = await ensureCdp();
     await humanType(page, rawKb, text, cfg, cdp);
   };
@@ -639,10 +660,32 @@ function patchFrames(
   originals: any,
   stealth: StealthEval,
 ): void {
-  for (const frame of iterFrames(page)) {
+  const patchFrame = (frame: Frame): void => {
+    if ((frame as any)._humanPatched) return;
     patchSingleFrame(frame, page, cfg, cursor, raw, rawKb, originals, stealth);
-    // Patch frame-level ElementHandle selectors ($, $$, waitForSelector)
     patchFrameElementHandles(frame, page, cfg, cursor, raw, rawKb, originals, stealth);
+    (frame as any)._humanPatched = true;
+  };
+
+  if (!(page as any)._humanFrameListenerAttached) {
+    page.on('frameattached', (frame: Frame) => {
+      try {
+        patchFrame(frame);
+      } catch (error) {
+        console.error('[cloakbrowser] Failed to humanize dynamically attached frame:', error);
+        throw error;
+      }
+    });
+    // Invalidate the isolated world on any main-frame nav, not just goto, so
+    // click/form navigations don't leave it bound to a stale doc (#507).
+    page.on('framenavigated', (frame: Frame) => {
+      if (frame === page.mainFrame()) stealth.invalidate();
+    });
+    (page as any)._humanFrameListenerAttached = true;
+  }
+
+  for (const frame of iterFrames(page)) {
+    patchFrame(frame);
   }
 }
 
@@ -674,8 +717,29 @@ function patchSingleFrame(
   originals: any,
   stealth: StealthEval,
 ): void {
-  if ((frame as any)._humanPatched) return;
-  (frame as any)._humanPatched = true;
+  // The main frame's Locator actions (page.locator(sel).click() etc.) delegate,
+  // in Playwright, to the main frame's own method. Route those to the already-
+  // patched page-level methods so they use the full humanized path with the
+  // isolated-world pre-click reads. Only true sub-frames use the frame-scoped
+  // path below (iterFrames() includes the main frame). Mirrors the Python
+  // wrapper, which intercepts at Locator.click and routes to page.click.
+  if (frame === page.mainFrame()) {
+    const p = page as any;
+    (frame as any).click = (selector: string, options?: HumanActionOptions) => p.click(selector, options);
+    (frame as any).dblclick = (selector: string, options?: HumanActionOptions) => p.dblclick(selector, options);
+    (frame as any).hover = (selector: string, options?: HumanActionOptions) => p.hover(selector, options);
+    (frame as any).type = (selector: string, text: string, options?: HumanActionOptions) => p.type(selector, text, options);
+    (frame as any).fill = (selector: string, value: string, options?: HumanActionOptions) => p.fill(selector, value, options);
+    (frame as any).check = (selector: string, options?: HumanActionOptions) => p.check(selector, options);
+    (frame as any).uncheck = (selector: string, options?: HumanActionOptions) => p.uncheck(selector, options);
+    (frame as any).selectOption = (selector: string, values: any, options?: HumanActionOptions) => p.selectOption(selector, values, options);
+    (frame as any).press = (selector: string, key: string, options?: HumanActionOptions) => p.press(selector, key, options);
+    (frame as any).pressSequentially = (selector: string, text: string, options?: HumanActionOptions) => p.pressSequentially(selector, text, options);
+    (frame as any).tap = (selector: string, options?: HumanActionOptions) => p.tap(selector, options);
+    (frame as any).clear = (selector: string, options?: HumanActionOptions) => p.clear(selector, options);
+    // dragAndDrop has no humanized page equivalent; left on the native path (still detectable, out of scope).
+    return;
+  }
 
   // Save originals for methods that need fallback
   const origFrameClick = frame.click.bind(frame);
@@ -686,7 +750,6 @@ function patchSingleFrame(
   const origFrameCheck = frame.check.bind(frame);
   const origFrameUncheck = frame.uncheck.bind(frame);
   const origFrameSelectOption = frame.selectOption.bind(frame);
-  const origFramePress = frame.press.bind(frame);
   const origFramePressSequentially = (frame as any).pressSequentially?.bind(frame);
   const origFrameTap = (frame as any).tap?.bind(frame);
   const origFrameDragAndDrop = frame.dragAndDrop.bind(frame);
@@ -798,7 +861,7 @@ function patchSingleFrame(
       await frameClick(selector, options);
     }
     await sleep(rand(50, 150));
-    await originals.keyboardPress(key);
+    await pressWithDelay(originals.keyboardPress, key, options);
   };
 
   (frame as any).pressSequentially = async (selector: string, text: string, options?: HumanActionOptions) => {
@@ -861,13 +924,17 @@ function patchSingleFrame(
 
 
 function* iterFrames(page: Page): Generator<Frame> {
-  try {
-    const mainFrame = page.mainFrame();
-    yield mainFrame;
-    for (const child of mainFrame.childFrames()) {
-      yield child;
+  function* walk(frame: Frame): Generator<Frame> {
+    yield frame;
+    for (const child of frame.childFrames()) {
+      yield* walk(child);
     }
-  } catch {}
+  }
+  try {
+    yield* walk(page.mainFrame());
+  } catch (error) {
+    console.error('[cloakbrowser] Failed to enumerate page frames:', error);
+  }
 }
 
 

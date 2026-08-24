@@ -42,6 +42,16 @@ from .actionability_async import (
 
 _SELECT_ALL = "Meta+a" if sys.platform == "darwin" else "Control+a"
 
+
+def _keyboard_press_kwargs(kwargs: dict[str, Any], default_delay: Optional[float] = None) -> dict[str, Any]:
+    """Return only options accepted by Playwright's Keyboard.press()."""
+    if "delay" in kwargs:
+        return {"delay": kwargs["delay"]}
+    if default_delay is not None:
+        return {"delay": default_delay}
+    return {}
+
+
 __all__ = [
     "patch_browser", "patch_context", "patch_page",
     "patch_browser_async", "patch_context_async", "patch_page_async",
@@ -564,7 +574,7 @@ def _patch_locator_class_sync():
             if not _is_selector_focused(tgt, selector):
                 tgt.click(selector, **fwd)
             sleep_ms(rand(50, 150))
-            self.page.keyboard.press(key)
+            self.page.keyboard.press(key, **_keyboard_press_kwargs(kwargs))
         else:
             _orig_press(self, key, **kwargs)
 
@@ -886,7 +896,7 @@ def _patch_locator_class_async():
             if not await _async_is_selector_focused(tgt, selector):
                 await tgt.click(selector, **fwd)
             await async_sleep_ms(rand(50, 150))
-            await self.page.keyboard.press(key)
+            await self.page.keyboard.press(key, **_keyboard_press_kwargs(kwargs))
         else:
             await _orig_press(self, key, **kwargs)
 
@@ -1015,6 +1025,17 @@ def patch_page(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         cdp_session = None
         logger.debug("Could not create CDP session — stealth features disabled")
 
+    if stealth is not None:
+        # Invalidate the isolated world on any main-frame nav, not just goto,
+        # so click/form navigations don't leave it bound to a stale doc (#507).
+        try:
+            page.on(
+                "framenavigated",
+                lambda frame: stealth.invalidate() if frame == page.main_frame else None,
+            )
+        except Exception:
+            logger.debug("Could not wire framenavigated invalidation")
+
     raw_mouse: RawMouse = type("_RawMouse", (), {
         "move": originals.mouse_move,
         "down": originals.mouse_down,
@@ -1068,7 +1089,14 @@ def patch_page(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         is_input = _is_input_element(page, selector)
         if not force and did_scroll:
             ensure_stable(page, selector, timeout=_remaining_ms())
-            box = page.locator(selector).first.bounding_box(timeout=max(1, _remaining_ms())) or box
+            # Waiting for the reflow to settle can push the element back out of
+            # view, and scrolling once before the wait is not enough: the click
+            # coords would land outside the viewport and hit nothing (#329).
+            box, cx, cy, _ = scroll_to_element(
+                page, raw_mouse, selector, cursor.x, cursor.y, call_cfg, timeout=_remaining_ms(),
+            )
+            cursor.x = cx
+            cursor.y = cy
         target = click_target(box, is_input, call_cfg)
         if not force:
             check_pointer_events(page, selector, target.x, target.y, stealth, timeout=_remaining_ms())
@@ -1099,7 +1127,14 @@ def patch_page(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         is_input = _is_input_element(page, selector)
         if not force and did_scroll:
             ensure_stable(page, selector, timeout=_remaining_ms())
-            box = page.locator(selector).first.bounding_box(timeout=max(1, _remaining_ms())) or box
+            # Waiting for the reflow to settle can push the element back out of
+            # view, and scrolling once before the wait is not enough: the click
+            # coords would land outside the viewport and hit nothing (#329).
+            box, cx, cy, _ = scroll_to_element(
+                page, raw_mouse, selector, cursor.x, cursor.y, call_cfg, timeout=_remaining_ms(),
+            )
+            cursor.x = cx
+            cursor.y = cy
         target = click_target(box, is_input, call_cfg)
         if not force:
             check_pointer_events(page, selector, target.x, target.y, stealth, timeout=_remaining_ms())
@@ -1132,7 +1167,14 @@ def patch_page(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         cursor.y = cy
         if not force and did_scroll:
             ensure_stable(page, selector, timeout=_remaining_ms())
-            box = page.locator(selector).first.bounding_box(timeout=max(1, _remaining_ms())) or box
+            # Waiting for the reflow to settle can push the element back out of
+            # view, and scrolling once before the wait is not enough: the click
+            # coords would land outside the viewport and hit nothing (#329).
+            box, cx, cy, _ = scroll_to_element(
+                page, raw_mouse, selector, cursor.x, cursor.y, call_cfg, timeout=_remaining_ms(),
+            )
+            cursor.x = cx
+            cursor.y = cy
         target = click_target(box, False, call_cfg)
         if not force:
             check_pointer_events(page, selector, target.x, target.y, stealth, timeout=_remaining_ms())
@@ -1238,7 +1280,7 @@ def patch_page(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         if not _is_selector_focused(page, selector):
             _human_click(selector, _skip_checks=True, timeout=_remaining_ms(), force=force, human_config=kwargs.get("human_config"))
         sleep_ms(rand(50, 150))
-        originals.keyboard_press(key)
+        originals.keyboard_press(key, **_keyboard_press_kwargs(kwargs))
 
     def _human_mouse_move(x: float, y: float, **kwargs: Any) -> None:
         _ensure_cursor_init()
@@ -1526,9 +1568,10 @@ def _patch_single_element_handle_sync(
     # --- el.press() ---
     def _human_el_press(key: str, **kwargs: Any) -> None:
         sleep_ms(rand(20, 60))
-        originals.keyboard_down(key)
-        sleep_ms(rand_range(cfg.key_hold))
-        originals.keyboard_up(key)
+        originals.keyboard_press(
+            key,
+            **_keyboard_press_kwargs(kwargs, default_delay=rand_range(cfg.key_hold)),
+        )
 
     # --- el.select_option() ---
     def _human_el_select_option(value: Any = None, **kwargs: Any) -> Any:
@@ -1686,6 +1729,18 @@ def _patch_frames_sync(
     page: Any, cfg: HumanConfig, cursor: _CursorState,
     raw_mouse: RawMouse, raw_keyboard: RawKeyboard, originals: Any,
 ) -> None:
+    def _on_frame_attached(frame: Any) -> None:
+        try:
+            _patch_single_frame_sync(frame, page, cfg, cursor, raw_mouse, raw_keyboard, originals)
+        except Exception:
+            logger.exception("Failed to humanize dynamically attached frame")
+
+    # Register before enumerating so frames attached during the initial scan
+    # cannot escape humanization. Playwright emits this for nested frames too.
+    if not getattr(page, "_human_frame_listener_attached", False):
+        page.on("frameattached", _on_frame_attached)
+        page._human_frame_listener_attached = True
+
     for frame in _iter_frames(page):
         _patch_single_frame_sync(frame, page, cfg, cursor, raw_mouse, raw_keyboard, originals)
 
@@ -1717,7 +1772,6 @@ def _patch_single_frame_sync(
 ) -> None:
     if getattr(frame, "_human_patched", False):
         return
-    frame._human_patched = True
 
     # Frame-scoped resolution: humanize via ``frame.locator(selector)`` so the
     # selector resolves in the sub-frame's own document, while the mouse stays
@@ -1872,7 +1926,7 @@ def _patch_single_frame_sync(
         if not _frame_is_focused(selector):
             _frame_click(selector, **kwargs)
         sleep_ms(rand(50, 150))
-        originals.keyboard_press(key)
+        originals.keyboard_press(key, **_keyboard_press_kwargs(kwargs))
 
     def _frame_clear(selector: str, **kwargs: Any) -> None:
         if not _frame_is_focused(selector):
@@ -1919,6 +1973,7 @@ def _patch_single_frame_sync(
     _patch_frame_element_handles_sync(
         frame, page, cfg, cursor, raw_mouse, raw_keyboard, originals, stealth_world, cdp_session
     )
+    frame._human_patched = True
 
 
 def _patch_frame_element_handles_sync(
@@ -1962,11 +2017,13 @@ def _patch_frame_element_handles_sync(
 
 
 def _iter_frames(page: Any):
+    def _walk(frame: Any):
+        yield frame
+        for child in frame.child_frames:
+            yield from _walk(child)
+
     try:
-        main = page.main_frame
-        yield main
-        for child in main.child_frames:
-            yield child
+        yield from _walk(page.main_frame)
     except Exception:
         pass
 
@@ -2049,6 +2106,16 @@ def patch_page_async(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
     cdp_session_holder: list[Any] = [None]  # mutable container for closure
     page._cdp_session_holder = cdp_session_holder  # expose for frame-level patching
 
+    # Invalidate the isolated world on any main-frame nav, not just goto, so
+    # click/form navigations don't leave it bound to a stale doc (#507).
+    try:
+        page.on(
+            "framenavigated",
+            lambda frame: stealth.invalidate() if frame == page.main_frame else None,
+        )
+    except Exception:
+        logger.debug("Could not wire framenavigated invalidation")
+
     async def _ensure_cdp() -> Any:
         if cdp_session_holder[0] is None:
             try:
@@ -2109,7 +2176,13 @@ def patch_page_async(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         is_input = await _async_is_input_element(page, selector)
         if not force and did_scroll:
             await async_ensure_stable(page, selector, timeout=_remaining_ms())
-            box = await page.locator(selector).first.bounding_box(timeout=max(1, _remaining_ms())) or box
+            # See the sync path: settling can move the element off-screen again,
+            # so re-scroll before computing click coords (#329).
+            box, cx, cy, _ = await async_scroll_to_element(
+                page, raw_mouse, selector, cursor.x, cursor.y, call_cfg, timeout=_remaining_ms(),
+            )
+            cursor.x = cx
+            cursor.y = cy
         target = click_target(box, is_input, call_cfg)
         if not force:
             await async_check_pointer_events(page, selector, target.x, target.y, stealth, timeout=_remaining_ms())
@@ -2140,7 +2213,13 @@ def patch_page_async(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         is_input = await _async_is_input_element(page, selector)
         if not force and did_scroll:
             await async_ensure_stable(page, selector, timeout=_remaining_ms())
-            box = await page.locator(selector).first.bounding_box(timeout=max(1, _remaining_ms())) or box
+            # See the sync path: settling can move the element off-screen again,
+            # so re-scroll before computing click coords (#329).
+            box, cx, cy, _ = await async_scroll_to_element(
+                page, raw_mouse, selector, cursor.x, cursor.y, call_cfg, timeout=_remaining_ms(),
+            )
+            cursor.x = cx
+            cursor.y = cy
         target = click_target(box, is_input, call_cfg)
         if not force:
             await async_check_pointer_events(page, selector, target.x, target.y, stealth, timeout=_remaining_ms())
@@ -2173,7 +2252,13 @@ def patch_page_async(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         cursor.y = cy
         if not force and did_scroll:
             await async_ensure_stable(page, selector, timeout=_remaining_ms())
-            box = await page.locator(selector).first.bounding_box(timeout=max(1, _remaining_ms())) or box
+            # See the sync path: settling can move the element off-screen again,
+            # so re-scroll before computing click coords (#329).
+            box, cx, cy, _ = await async_scroll_to_element(
+                page, raw_mouse, selector, cursor.x, cursor.y, call_cfg, timeout=_remaining_ms(),
+            )
+            cursor.x = cx
+            cursor.y = cy
         target = click_target(box, False, call_cfg)
         if not force:
             await async_check_pointer_events(page, selector, target.x, target.y, stealth, timeout=_remaining_ms())
@@ -2266,7 +2351,7 @@ def patch_page_async(page: Any, cfg: HumanConfig, cursor: _CursorState) -> None:
         if not await _async_is_selector_focused(page, selector):
             await _human_click(selector, _skip_checks=True, timeout=_remaining_ms(), force=force, human_config=kwargs.get("human_config"))
         await async_sleep_ms(rand(50, 150))
-        await originals.keyboard_press(key)
+        await originals.keyboard_press(key, **_keyboard_press_kwargs(kwargs))
 
     async def _human_select_option(selector: str, value: Any = None, **kwargs: Any) -> Any:
         force = kwargs.get("force", False)
@@ -2571,9 +2656,10 @@ def _patch_single_element_handle_async(
     # --- el.press() ---
     async def _human_el_press(key: str, **kwargs: Any) -> None:
         await async_sleep_ms(rand(20, 60))
-        await originals.keyboard_down(key)
-        await async_sleep_ms(rand_range(cfg.key_hold))
-        await originals.keyboard_up(key)
+        await originals.keyboard_press(
+            key,
+            **_keyboard_press_kwargs(kwargs, default_delay=rand_range(cfg.key_hold)),
+        )
 
     # --- el.select_option() ---
     async def _human_el_select_option(value: Any = None, **kwargs: Any) -> Any:
@@ -2731,6 +2817,18 @@ def _patch_frames_async(
     page: Any, cfg: HumanConfig, cursor: _CursorState,
     raw_mouse: AsyncRawMouse, raw_keyboard: AsyncRawKeyboard, originals: Any,
 ) -> None:
+    def _on_frame_attached(frame: Any) -> None:
+        try:
+            _patch_single_frame_async(frame, page, cfg, cursor, raw_mouse, raw_keyboard, originals)
+        except Exception:
+            logger.exception("Failed to humanize dynamically attached frame")
+
+    # Async Playwright events accept a regular callback; patching only replaces
+    # methods, so no task or await is needed here.
+    if not getattr(page, "_human_frame_listener_attached", False):
+        page.on("frameattached", _on_frame_attached)
+        page._human_frame_listener_attached = True
+
     for frame in _iter_frames(page):
         _patch_single_frame_async(frame, page, cfg, cursor, raw_mouse, raw_keyboard, originals)
 
@@ -2762,7 +2860,6 @@ def _patch_single_frame_async(
 ) -> None:
     if getattr(frame, "_human_patched", False):
         return
-    frame._human_patched = True
 
     # Frame-scoped resolution (async): humanize via ``frame.locator(selector)`` so
     # the selector resolves in the sub-frame's own document, while the mouse stays
@@ -2920,7 +3017,7 @@ def _patch_single_frame_async(
         if not await _frame_is_focused(selector):
             await _frame_click(selector, **kwargs)
         await async_sleep_ms(rand(50, 150))
-        await originals.keyboard_press(key)
+        await originals.keyboard_press(key, **_keyboard_press_kwargs(kwargs))
 
     async def _frame_clear(selector: str, **kwargs: Any) -> None:
         if not await _frame_is_focused(selector):
@@ -2967,6 +3064,7 @@ def _patch_single_frame_async(
     _patch_frame_element_handles_async(
         frame, page, cfg, cursor, raw_mouse, raw_keyboard, originals, stealth_world, cdp_session_holder
     )
+    frame._human_patched = True
 
 
 def _patch_frame_element_handles_async(

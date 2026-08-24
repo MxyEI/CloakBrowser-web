@@ -40,8 +40,14 @@ public static class Humanize
     public static IBrowserContext Context(IBrowserContext context, HumanConfig? config = null)
     {
         if (context is HumanizedBrowserContext) return context;
-        return new HumanizedBrowserContext(context, config ?? new HumanConfig());
+        // Memoize per raw context so page.Context returns a stable instance (Playwright's
+        // own context is a singleton); a fresh wrapper each access would break reference
+        // identity and dictionary-key use.
+        return ContextCache.GetValue(context, key => new HumanizedBrowserContext(key, config ?? new HumanConfig()));
     }
+
+    /// <summary>One humanized wrapper per raw context, so identity stays stable across accesses.</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IBrowserContext, HumanizedBrowserContext> ContextCache = new();
 
     /// <summary>
     /// Wrap a raw Playwright <see cref="IBrowser"/> so every context/page it produces
@@ -54,12 +60,28 @@ public static class Humanize
         return new HumanizedBrowser(browser, config ?? new HumanConfig(), headless, headlessNoViewport);
     }
 
+    /// <summary>
+    /// Recover the raw Playwright <see cref="IPage"/> behind any CloakBrowser wrapper
+    /// (humanize decorator and/or license-guard proxy). Pass the result to Playwright APIs
+    /// that reject wrapped handles, e.g. <c>context.NewCDPSessionAsync(Humanize.Unwrap(page))</c>.
+    /// </summary>
+    public static IPage Unwrap(IPage page) => (IPage)LicenseGuard.Unwrap(page);
+
+    /// <summary>Recover the raw Playwright <see cref="IFrame"/> behind any CloakBrowser wrapper.</summary>
+    public static IFrame Unwrap(IFrame frame) => (IFrame)LicenseGuard.Unwrap(frame);
+
+    /// <summary>Recover the raw Playwright <see cref="IBrowserContext"/> behind any CloakBrowser wrapper.</summary>
+    public static IBrowserContext Unwrap(IBrowserContext context) => (IBrowserContext)LicenseGuard.Unwrap(context);
+
+    /// <summary>Recover the raw Playwright <see cref="IElementHandle"/> behind any CloakBrowser wrapper.</summary>
+    public static IElementHandle Unwrap(IElementHandle handle) => (IElementHandle)LicenseGuard.Unwrap(handle);
+
     // -----------------------------------------------------------------------
     // Internal re-wrap helpers (shared by the wrappers).
     // -----------------------------------------------------------------------
 
-    internal static ILocator WrapLocator(ILocator locator, HumanCursor cursor, HumanConfig cfg) =>
-        locator is HumanizedLocator ? locator : new HumanizedLocator(locator, cursor, cfg);
+    internal static ILocator WrapLocator(ILocator locator, HumanCursor cursor, HumanConfig cfg, string? selector = null) =>
+        locator is HumanizedLocator ? locator : new HumanizedLocator(locator, cursor, cfg, selector);
 
     internal static IFrame WrapFrame(IFrame frame, HumanCursor cursor, HumanConfig cfg) =>
         frame is HumanizedFrame ? frame : new HumanizedFrame(frame, cursor, cfg);
@@ -99,8 +121,8 @@ public static class Humanize
 }
 
 /// <summary>
-/// Shared helpers for reading Force/Timeout out of the per-action Playwright option
-/// objects, which all expose <c>Force</c> and <c>Timeout</c> but have no common base.
+/// Shared helpers for reading Force/Timeout/Delay out of per-action Playwright option
+/// objects, which expose these properties but have no common base.
 /// </summary>
 internal static class OptionReader
 {
@@ -111,5 +133,11 @@ internal static class OptionReader
     {
         var v = options?.GetType().GetProperty("Timeout")?.GetValue(options);
         return v is float f ? f : v is double d ? d : 30000;
+    }
+
+    public static float? Delay(object? options)
+    {
+        var v = options?.GetType().GetProperty("Delay")?.GetValue(options);
+        return v is float f ? f : v is double d ? (float)d : null;
     }
 }

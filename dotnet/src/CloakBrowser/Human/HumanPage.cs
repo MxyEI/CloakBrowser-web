@@ -12,6 +12,9 @@ public sealed class HumanActionOptions
     /// <summary>Skip all actionability checks and motion guarantees when true.</summary>
     public bool Force { get; set; }
 
+    /// <summary>Delay in milliseconds between keydown and keyup for press actions.</summary>
+    public float? Delay { get; set; }
+
     /// <summary>Per-call config overrides (snake_case or PascalCase keys), merged on top of the page config.</summary>
     public IReadOnlyDictionary<string, object>? HumanConfig { get; set; }
 }
@@ -67,6 +70,13 @@ public sealed class HumanPage
         _rawKeyboard = new PlaywrightRawKeyboard(page.Keyboard);
         _scrollPage = new PlaywrightScrollPage(page);
         _evaluator = new PlaywrightEvaluator(page);
+
+        // Invalidate the isolated world on any main-frame nav, not just goto, so
+        // click/form navigations don't leave it bound to a stale doc (#507).
+        _page.FrameNavigated += (_, frame) =>
+        {
+            if (frame == _page.MainFrame) _stealth?.Invalidate();
+        };
     }
 
     /// <summary>
@@ -188,19 +198,37 @@ public sealed class HumanPage
 
     private async Task<BoundingBox?> GetBoxAsync(string selector, double timeoutMs)
     {
+        // Read geometry through the isolated world when available; only an unsupported
+        // selector (or no world) reaches Playwright's BoundingBox.
+        if (_stealth != null)
+        {
+            var (status, box) = await StealthDom.BoxAsync(_stealth, selector).ConfigureAwait(false);
+            if (status == StealthStatus.Ok) return box;
+            if (status == StealthStatus.NotFound) return null;
+            // Unsupported -> Playwright below
+        }
         try
         {
-            var box = await _page.Locator(selector).First.BoundingBoxAsync(new LocatorBoundingBoxOptions
+            var b = await _page.Locator(selector).First.BoundingBoxAsync(new LocatorBoundingBoxOptions
             {
                 Timeout = (float)Math.Max(1, timeoutMs),
             }).ConfigureAwait(false);
-            return box == null ? null : new BoundingBox(box.X, box.Y, box.Width, box.Height);
+            return b == null ? null : new BoundingBox(b.X, b.Y, b.Width, b.Height);
         }
         catch (Exception)
         {
             return null;
         }
+
     }
+
+    // Thread the page's isolated world into the shared actionability helpers.
+    private Task EnsureActionableWorldAsync(string selector, IReadOnlySet<string> checks, double timeoutMs, bool force) =>
+        Actionability.EnsureActionableAsync(_page, selector, checks, timeoutMs, force, _stealth);
+    private Task EnsureStableWorldAsync(string selector, double timeoutMs) =>
+        Actionability.EnsureStableAsync(_page, selector, timeoutMs, _stealth);
+    private Task CheckPointerEventsWorldAsync(string selector, double x, double y, double timeoutMs) =>
+        Actionability.CheckPointerEventsAsync(_page, selector, x, y, timeoutMs, _stealth);
 
     // -----------------------------------------------------------------------
     // Navigation
@@ -231,7 +259,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force && !skipChecks)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksClick, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksClick, RemainingMs(deadline), force).ConfigureAwait(false);
         if (callCfg.IdleBetweenActions)
             await HumanMouse.HumanIdleAsync(_rawMouse, HumanRandom.Rand(callCfg.IdleBetweenDuration.Min, callCfg.IdleBetweenDuration.Max), _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
 
@@ -245,12 +273,20 @@ public sealed class HumanPage
         bool isInput = await IsInputElementAsync(selector).ConfigureAwait(false);
         if (!force && scroll.DidScroll)
         {
-            await Actionability.EnsureStableAsync(_page, selector, RemainingMs(deadline)).ConfigureAwait(false);
-            box = await GetBoxAsync(selector, RemainingMs(deadline)).ConfigureAwait(false) ?? box;
+            await EnsureStableWorldAsync(selector, RemainingMs(deadline)).ConfigureAwait(false);
+            // Waiting for the reflow to settle can push the element back out of
+            // view, and scrolling once before the wait is not enough: the click
+            // coords would land outside the viewport and hit nothing (#329).
+            var rescroll = await HumanScroll.HumanScrollIntoViewAsync(
+                _scrollPage, _rawMouse, () => GetBoxAsync(selector, RemainingMs(deadline)),
+                _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
+            _cursor.X = rescroll.CursorX;
+            _cursor.Y = rescroll.CursorY;
+            box = rescroll.Box;
         }
         var target = HumanMouse.ClickTarget(box, isInput, callCfg);
         if (!force)
-            await Actionability.CheckPointerEventsAsync(_page, selector, target.X, target.Y, RemainingMs(deadline)).ConfigureAwait(false);
+            await CheckPointerEventsWorldAsync(selector, target.X, target.Y, RemainingMs(deadline)).ConfigureAwait(false);
         await HumanMouse.HumanMoveAsync(_rawMouse, _cursor.X, _cursor.Y, target.X, target.Y, callCfg).ConfigureAwait(false);
         _cursor.X = target.X;
         _cursor.Y = target.Y;
@@ -271,7 +307,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksClick, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksClick, RemainingMs(deadline), force).ConfigureAwait(false);
         if (callCfg.IdleBetweenActions)
             await HumanMouse.HumanIdleAsync(_rawMouse, HumanRandom.Rand(callCfg.IdleBetweenDuration.Min, callCfg.IdleBetweenDuration.Max), _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
 
@@ -285,12 +321,20 @@ public sealed class HumanPage
         bool isInput = await IsInputElementAsync(selector).ConfigureAwait(false);
         if (!force && scroll.DidScroll)
         {
-            await Actionability.EnsureStableAsync(_page, selector, RemainingMs(deadline)).ConfigureAwait(false);
-            box = await GetBoxAsync(selector, RemainingMs(deadline)).ConfigureAwait(false) ?? box;
+            await EnsureStableWorldAsync(selector, RemainingMs(deadline)).ConfigureAwait(false);
+            // Waiting for the reflow to settle can push the element back out of
+            // view, and scrolling once before the wait is not enough: the click
+            // coords would land outside the viewport and hit nothing (#329).
+            var rescroll = await HumanScroll.HumanScrollIntoViewAsync(
+                _scrollPage, _rawMouse, () => GetBoxAsync(selector, RemainingMs(deadline)),
+                _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
+            _cursor.X = rescroll.CursorX;
+            _cursor.Y = rescroll.CursorY;
+            box = rescroll.Box;
         }
         var target = HumanMouse.ClickTarget(box, isInput, callCfg);
         if (!force)
-            await Actionability.CheckPointerEventsAsync(_page, selector, target.X, target.Y, RemainingMs(deadline)).ConfigureAwait(false);
+            await CheckPointerEventsWorldAsync(selector, target.X, target.Y, RemainingMs(deadline)).ConfigureAwait(false);
         await HumanMouse.HumanMoveAsync(_rawMouse, _cursor.X, _cursor.Y, target.X, target.Y, callCfg).ConfigureAwait(false);
         _cursor.X = target.X;
         _cursor.Y = target.Y;
@@ -317,7 +361,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force && !skipChecks)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksHover, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksHover, RemainingMs(deadline), force).ConfigureAwait(false);
         if (callCfg.IdleBetweenActions)
             await HumanMouse.HumanIdleAsync(_rawMouse, HumanRandom.Rand(callCfg.IdleBetweenDuration.Min, callCfg.IdleBetweenDuration.Max), _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
 
@@ -330,12 +374,20 @@ public sealed class HumanPage
 
         if (!force && scroll.DidScroll)
         {
-            await Actionability.EnsureStableAsync(_page, selector, RemainingMs(deadline)).ConfigureAwait(false);
-            box = await GetBoxAsync(selector, RemainingMs(deadline)).ConfigureAwait(false) ?? box;
+            await EnsureStableWorldAsync(selector, RemainingMs(deadline)).ConfigureAwait(false);
+            // Waiting for the reflow to settle can push the element back out of
+            // view, and scrolling once before the wait is not enough: the click
+            // coords would land outside the viewport and hit nothing (#329).
+            var rescroll = await HumanScroll.HumanScrollIntoViewAsync(
+                _scrollPage, _rawMouse, () => GetBoxAsync(selector, RemainingMs(deadline)),
+                _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
+            _cursor.X = rescroll.CursorX;
+            _cursor.Y = rescroll.CursorY;
+            box = rescroll.Box;
         }
         var target = HumanMouse.ClickTarget(box, false, callCfg);
         if (!force)
-            await Actionability.CheckPointerEventsAsync(_page, selector, target.X, target.Y, RemainingMs(deadline)).ConfigureAwait(false);
+            await CheckPointerEventsWorldAsync(selector, target.X, target.Y, RemainingMs(deadline)).ConfigureAwait(false);
         await HumanMouse.HumanMoveAsync(_rawMouse, _cursor.X, _cursor.Y, target.X, target.Y, callCfg).ConfigureAwait(false);
         _cursor.X = target.X;
         _cursor.Y = target.Y;
@@ -354,7 +406,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.RandRange(callCfg.FieldSwitchDelay)).ConfigureAwait(false);
         await ClickInternalAsync(selector, new HumanActionOptions { Timeout = RemainingMs(deadline), Force = force, HumanConfig = options?.HumanConfig }, skipChecks: true).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(100, 250)).ConfigureAwait(false);
@@ -370,7 +422,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.RandRange(callCfg.FieldSwitchDelay)).ConfigureAwait(false);
         await ClickInternalAsync(selector, new HumanActionOptions { Timeout = RemainingMs(deadline), Force = force, HumanConfig = options?.HumanConfig }, skipChecks: true).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(100, 250)).ConfigureAwait(false);
@@ -393,7 +445,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksCheck, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksCheck, RemainingMs(deadline), force).ConfigureAwait(false);
         bool checked_;
         try { checked_ = await _page.IsCheckedAsync(selector).ConfigureAwait(false); }
         catch (Exception) { checked_ = false; }
@@ -409,7 +461,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksCheck, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksCheck, RemainingMs(deadline), force).ConfigureAwait(false);
         bool checked_;
         try { checked_ = await _page.IsCheckedAsync(selector).ConfigureAwait(false); }
         catch (Exception) { checked_ = true; }
@@ -429,7 +481,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksFocus, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksFocus, RemainingMs(deadline), force).ConfigureAwait(false);
         await HoverInternalAsync(selector, new HumanActionOptions { Timeout = RemainingMs(deadline), Force = force, HumanConfig = options?.HumanConfig }, skipChecks: true).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(100, 300)).ConfigureAwait(false);
         return await _page.SelectOptionAsync(selector, values).ConfigureAwait(false);
@@ -447,11 +499,11 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksFocus, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksFocus, RemainingMs(deadline), force).ConfigureAwait(false);
         if (!await IsSelectorFocusedAsync(selector).ConfigureAwait(false))
             await ClickInternalAsync(selector, new HumanActionOptions { Timeout = RemainingMs(deadline), Force = force, HumanConfig = options?.HumanConfig }, skipChecks: true).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(50, 150)).ConfigureAwait(false);
-        await _page.Keyboard.PressAsync(key).ConfigureAwait(false);
+        await HumanKeyboard.PressAsync(_page.Keyboard, key, options?.Delay).ConfigureAwait(false);
     }
 
     // -----------------------------------------------------------------------
@@ -467,7 +519,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksCheck, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksCheck, RemainingMs(deadline), force).ConfigureAwait(false);
         bool current;
         try { current = await _page.IsCheckedAsync(selector).ConfigureAwait(false); }
         catch (Exception) { current = !checked_; }
@@ -496,7 +548,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
         if (!await IsSelectorFocusedAsync(selector).ConfigureAwait(false))
             await ClickInternalAsync(selector, new HumanActionOptions { Timeout = RemainingMs(deadline), Force = force, HumanConfig = options?.HumanConfig }, skipChecks: true).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(50, 150)).ConfigureAwait(false);
@@ -516,7 +568,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksInput, RemainingMs(deadline), force).ConfigureAwait(false);
         if (!await IsSelectorFocusedAsync(selector).ConfigureAwait(false))
             await ClickInternalAsync(selector, new HumanActionOptions { Timeout = RemainingMs(deadline), Force = force, HumanConfig = options?.HumanConfig }, skipChecks: true).ConfigureAwait(false);
         await HumanRandom.SleepMsAsync(HumanRandom.Rand(50, 100)).ConfigureAwait(false);
@@ -541,7 +593,7 @@ public sealed class HumanPage
         double deadline = Environment.TickCount64 + timeout;
 
         if (!force)
-            await Actionability.EnsureActionableAsync(_page, selector, Actionability.ChecksFocus, RemainingMs(deadline), force).ConfigureAwait(false);
+            await EnsureActionableWorldAsync(selector, Actionability.ChecksFocus, RemainingMs(deadline), force).ConfigureAwait(false);
 
         var scroll = await HumanScroll.HumanScrollIntoViewAsync(
             _scrollPage, _rawMouse, () => GetBoxAsync(selector, RemainingMs(deadline)),
@@ -551,8 +603,16 @@ public sealed class HumanPage
         var box = scroll.Box;
         if (!force && scroll.DidScroll)
         {
-            await Actionability.EnsureStableAsync(_page, selector, RemainingMs(deadline)).ConfigureAwait(false);
-            box = await GetBoxAsync(selector, RemainingMs(deadline)).ConfigureAwait(false) ?? box;
+            await EnsureStableWorldAsync(selector, RemainingMs(deadline)).ConfigureAwait(false);
+            // Waiting for the reflow to settle can push the element back out of
+            // view, and scrolling once before the wait is not enough: the click
+            // coords would land outside the viewport and hit nothing (#329).
+            var rescroll = await HumanScroll.HumanScrollIntoViewAsync(
+                _scrollPage, _rawMouse, () => GetBoxAsync(selector, RemainingMs(deadline)),
+                _cursor.X, _cursor.Y, callCfg).ConfigureAwait(false);
+            _cursor.X = rescroll.CursorX;
+            _cursor.Y = rescroll.CursorY;
+            box = rescroll.Box;
         }
         var target = HumanMouse.ClickTarget(box, false, callCfg);
         await HumanMouse.HumanMoveAsync(_rawMouse, _cursor.X, _cursor.Y, target.X, target.Y, callCfg).ConfigureAwait(false);

@@ -146,6 +146,18 @@ public class MouseKeyboardWrapperTests
     }
 
     [Fact]
+    public async Task Keyboard_PressAsync_forwards_delay()
+    {
+        var (page, _, _, kbRec) = BuildPage();
+        var kb = new HumanizedKeyboard(page.Keyboard, MakeCursor(page), FastConfig());
+
+        await kb.PressAsync("Control+V", new KeyboardPressOptions { Delay = 300 });
+
+        var options = Assert.IsType<KeyboardPressOptions>(kbRec.Last("PressAsync")!.Args[1]);
+        Assert.Equal(300, options.Delay);
+    }
+
+    [Fact]
     public Task Keyboard_Original_and_Inner_expose_the_unwrapped_object()
     {
         var (page, _, _, _) = BuildPage();

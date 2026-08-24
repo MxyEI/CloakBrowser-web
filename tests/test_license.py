@@ -16,6 +16,7 @@ from cloakbrowser.license import (
     get_active_session_count,
     get_pro_latest_release,
     get_pro_latest_version,
+    get_session_seats,
     resolve_license_key,
     validate_license,
 )
@@ -505,8 +506,9 @@ class TestGetProLatestVersion:
 
 
 class TestGetActiveSessionCount:
-    def _resp(self, payload):
+    def _resp(self, payload, status=200):
         mock_resp = MagicMock()
+        mock_resp.status_code = status
         mock_resp.json.return_value = payload
         mock_resp.raise_for_status = MagicMock()
         return mock_resp
@@ -561,6 +563,117 @@ class TestGetActiveSessionCount:
             get_active_session_count("cb_key")
 
         assert mock_post.call_count == 2
+
+
+# ── get_session_seats ─────────────────────────────────
+
+
+class TestGetSessionSeats:
+    """The six failure paths that used to collapse into one bare None."""
+
+    def _resp(self, payload, status=200):
+        mock_resp = MagicMock()
+        mock_resp.status_code = status
+        mock_resp.json.return_value = payload
+        return mock_resp
+
+    def test_reports_count_and_limit(self):
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": True, "active": 8, "limit": 2000}),
+        ):
+            seats = get_session_seats("cb_key")
+
+        assert (seats.active, seats.limit, seats.state) == (8, 2000, "ok")
+
+    def test_missing_limit_is_none_not_an_error(self):
+        """A server predating the field still yields a usable count."""
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": True, "active": 8}),
+        ):
+            seats = get_session_seats("cb_key")
+
+        assert seats.state == "ok"
+        assert seats.active == 8
+        assert seats.limit is None
+
+    def test_null_limit_is_none(self):
+        """Unlimited licence or unrecognised plan — the server says so explicitly."""
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": True, "active": 3, "limit": None}),
+        ):
+            assert get_session_seats("cb_key").limit is None
+
+    def test_zero_seats_is_a_real_answer(self):
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": True, "active": 0, "limit": 5}),
+        ):
+            seats = get_session_seats("cb_key")
+
+        assert seats.state == "ok"
+        assert seats.active == 0
+
+    def test_network_failure_is_unreachable(self):
+        """info is a diagnostic — it degrades, it never raises out of the command."""
+        with patch("cloakbrowser.license.httpx.post", side_effect=Exception("network")):
+            seats = get_session_seats("cb_key")
+
+        assert seats.state == "unreachable"
+        assert seats.active is None
+
+    def test_denial_carries_the_server_reason(self):
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": False, "error": "license_inactive"}, status=403),
+        ):
+            seats = get_session_seats("cb_key")
+
+        assert seats.state == "denied"
+        assert seats.reason == "license_inactive"
+
+    def test_rate_limit_is_a_denial(self):
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": False, "error": "rate_limited"}, status=429),
+        ):
+            assert get_session_seats("cb_key").reason == "rate_limited"
+
+    def test_denial_without_a_body_falls_back_to_the_status(self):
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.json.side_effect = ValueError("not json")
+        with patch("cloakbrowser.license.httpx.post", return_value=resp):
+            assert get_session_seats("cb_key").reason == "HTTP 500"
+
+    def test_server_reported_unavailable_is_unknown_not_denied(self):
+        """Leaseless mode: 200, key is fine, the server just cannot count. This is the
+        distinction the old single None destroyed."""
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": True, "active": None, "limit": None}),
+        ):
+            seats = get_session_seats("cb_key")
+
+        assert seats.state == "unknown"
+        assert seats.active is None
+
+    def test_unparseable_body_is_unknown(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("not json")
+        with patch("cloakbrowser.license.httpx.post", return_value=resp):
+            assert get_session_seats("cb_key").state == "unknown"
+
+    def test_old_helper_still_returns_the_bare_count(self):
+        """get_active_session_count is shipped public API — it must keep behaving."""
+        with patch(
+            "cloakbrowser.license.httpx.post",
+            return_value=self._resp({"valid": True, "active": 4, "limit": 20}),
+        ):
+            assert get_active_session_count("cb_key") == 4
 
 
 # ── Config pro parameter ──────────────────────────────
@@ -815,3 +928,38 @@ class TestBuildLaunchEnv:
         """Empty/whitespace key param treated as absent → None."""
         assert build_launch_env(license_key="") is None
         assert build_launch_env(license_key="   ") is None
+
+    def test_status_file_carried_on_inherit_path(self):
+        """status_file must reach the child even on an inherit-parent-env path.
+        Env source with no user_env would normally return None (inherit); with a
+        status_file it must become a full os.environ copy carrying both the key
+        and the status var (Playwright replaces, not merges)."""
+        from cloakbrowser.license import LICENSE_STATUS_FILE_ENV
+        with patch.dict(os.environ, {"CLOAKBROWSER_LICENSE_KEY": "cb_env"}):
+            result = build_launch_env(status_file="/tmp/denials/x.json")
+            assert result is not None
+            assert result[LICENSE_STATUS_FILE_ENV] == "/tmp/denials/x.json"
+            assert result["CLOAKBROWSER_LICENSE_KEY"] == "cb_env"
+            assert "HOME" in result  # seeded from parent env
+
+    def test_status_file_on_default_file_keeps_key_out_of_env(self, tmp_path):
+        """default_file source + status_file → the status var is injected but the
+        key stays out of the env (binary still reads the key file; HOME present)."""
+        from cloakbrowser.license import LICENSE_STATUS_FILE_ENV
+        home_dir = tmp_path / "home"
+        default_cache = home_dir / ".cloakbrowser"
+        default_cache.mkdir(parents=True)
+        (default_cache / "license.key").write_text("cb_file_key\n")
+        with patch.dict(os.environ, {"HOME": str(home_dir)}, clear=True), \
+             patch("cloakbrowser.license.get_cache_dir", return_value=default_cache), \
+             patch("pathlib.Path.home", return_value=home_dir):
+            result = build_launch_env(status_file="/tmp/denials/y.json")
+            assert result is not None
+            assert result[LICENSE_STATUS_FILE_ENV] == "/tmp/denials/y.json"
+            assert "CLOAKBROWSER_LICENSE_KEY" not in result
+            assert result["HOME"] == str(home_dir)
+
+    def test_no_status_file_unchanged(self):
+        """Omitting status_file preserves the original behavior exactly."""
+        with patch.dict(os.environ, {"CLOAKBROWSER_LICENSE_KEY": "cb_env"}):
+            assert build_launch_env() is None
