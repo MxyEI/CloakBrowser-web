@@ -1408,6 +1408,16 @@ def test_cloud_settings_refuse_insecure_public_bind(tmp_path):
     with pytest.raises(ValueError, match="at least 32"):
         weak.validate_bind("0.0.0.0")
 
+    container_local = CloudSettings(
+        database_url=settings.database_url,
+        secret_key="container-secret-that-is-at-least-32-characters",
+        cookie_secure=False,
+        development_secret=False,
+    )
+    container_local.validate_bind("0.0.0.0", container_loopback=True)
+    with pytest.raises(ValueError, match="only valid"):
+        container_local.validate_bind("127.0.0.1", container_loopback=True)
+
 
 def test_cloud_settings_parse_superadmin_email_allowlist(tmp_path, monkeypatch):
     monkeypatch.setenv(
@@ -1455,6 +1465,10 @@ def test_cloud_cli_parser_defaults():
     assert args.host == "127.0.0.1"
     assert args.port == 8777
     assert args.no_open is True
+    assert args.container_loopback is False
+
+    container_args = parser.parse_args(["cloud", "--container-loopback"])
+    assert container_args.container_loopback is True
 
 
 def test_workspace_cli_parser_and_private_device_identity(tmp_path):

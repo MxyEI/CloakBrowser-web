@@ -3,3 +3,24 @@
 # this is defense-in-depth against a future `COPY . .`.
 test-infra/signing/
 *.pem
+
+# Keep local state, caches, credentials, and unrelated build output out of both
+# the standard browser image and the smaller cloud control-plane image.
+.git/
+.github/
+.idea/
+.vscode/
+.venv/
+.cloakbrowser/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.db
+.env
+dist/
+build/
+htmlcov/
+js/node_modules/
+js/dist/
+dotnet/bin/
+dotnet/obj/

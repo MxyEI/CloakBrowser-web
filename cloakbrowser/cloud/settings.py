@@ -192,7 +192,11 @@ class CloudSettings:
             superadmin_emails=superadmin_emails,
         )
 
-    def validate_bind(self, host: str) -> None:
+    def validate_bind(self, host: str, *, container_loopback: bool = False) -> None:
+        if container_loopback and host not in PUBLIC_HOSTS:
+            raise ValueError(
+                "container_loopback is only valid when the container binds to 0.0.0.0 or ::"
+            )
         if host in PUBLIC_HOSTS and self.development_secret:
             raise ValueError(
                 "CLOAKBROWSER_CLOUD_SECRET must be set before binding the cloud server publicly"
@@ -201,7 +205,7 @@ class CloudSettings:
             raise ValueError(
                 "CLOAKBROWSER_CLOUD_SECRET must contain at least 32 characters"
             )
-        if host in PUBLIC_HOSTS and not self.cookie_secure:
+        if host in PUBLIC_HOSTS and not self.cookie_secure and not container_loopback:
             raise ValueError(
                 "CLOAKBROWSER_CLOUD_COOKIE_SECURE=true is required for a public cloud server"
             )

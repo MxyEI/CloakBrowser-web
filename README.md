@@ -350,6 +350,56 @@ Set a proxy or select managed extensions in the environment editor. Editing
 runtime assets is blocked while the environment is running, and revision
 conflicts or incompatible Agent capabilities are reported before launch.
 
+### One-command Cloud Docker deployment
+
+The dedicated Cloud image contains the control plane and web UI without the
+Chromium runtime, Node.js, or desktop fonts from the general-purpose browser
+image. For a local installation, the script builds the current working tree,
+generates persistent secrets outside the repository, and publishes the container
+only on host loopback:
+
+```bash
+./scripts/deploy-cloud-local-docker.sh
+# Override the host port when needed:
+CLOUD_PORT=8877 ./scripts/deploy-cloud-local-docker.sh
+```
+
+Open `http://127.0.0.1:8777`. Re-running the script replaces only its named
+container and retains the `cloakbrowser-cloud-local-data` Docker volume. Secrets
+and runtime settings default to
+`~/.local/state/cloakbrowser-cloud-local` (or `$XDG_STATE_HOME`). Set
+`CLOUD_STATE_DIR` to move that owner-controlled directory.
+
+The server script packages the current clean Git commit, transfers it over SSH,
+builds the image on the server, and binds the container to server loopback. It
+does not expose an insecure public HTTP listener or modify other containers:
+
+```bash
+CLOUD_PUBLIC_URL='https://cloud.example.com' \
+  ./scripts/deploy-cloud-server-docker.sh root@server.example.com 22
+
+# Custom upstream port, including a non-standard SSH port:
+CLOUD_PORT=18777 \
+  ./scripts/deploy-cloud-server-docker.sh root@server.example.com 36803
+```
+
+Point the server's HTTPS reverse proxy at `http://127.0.0.1:18777`. The public
+URL must use a trusted TLS certificate because Agent and Workspace clients reject
+remote plaintext HTTP. The server keeps secrets under
+`/opt/cloakbrowser-cloud-docker` with mode `0600` and browser snapshots in the
+`cloakbrowser-cloud-data` Docker volume. Both survive repeated deployments.
+`CLOUD_PUBLIC_URL` is an informational label printed after deployment; proxy and
+DNS configuration remain outside the script so it cannot disturb an existing
+web stack.
+
+Self-registration is intentionally left available for the first dedicated
+platform account. Register that account first, then persist the platform
+allowlist by re-running the same script with, for example,
+`CLOUD_SUPERADMIN_EMAILS='root@example.com'`. Omitting the variable on later
+runs preserves its last value; setting it to an empty string clears the
+allowlist. The one-container default uses SQLite. Configure PostgreSQL before
+running multiple control-plane instances.
+
 ## Install
 
 **Python:**

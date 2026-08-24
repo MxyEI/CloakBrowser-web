@@ -245,6 +245,22 @@ CloakBrowser binary and the selected environment configuration.
 - `CLOAKBROWSER_CLOUD_LOG_LEVEL`
 - `CLOAKBROWSER_CLOUD_URL` and `CLOAKBROWSER_AGENT_TOKEN` for Agents
 
+## Docker Deployment
+
+- `Dockerfile.cloud` builds a non-root control-plane-only image with a persistent
+  `/data` volume and an HTTP health check. It does not include Chromium, Node.js,
+  Xvfb, or the browser image's desktop font packages.
+- `scripts/deploy-cloud-local-docker.sh` publishes only to host loopback, creates
+  stable secrets outside the repository, and retains a named Docker volume across
+  upgrades.
+- `scripts/deploy-cloud-server-docker.sh` archives a clean Git commit, uploads it
+  over SSH, builds remotely, and publishes only to server loopback for an existing
+  HTTPS reverse proxy. It scopes replacement to its named Cloud container and
+  never prunes unrelated images, volumes, or containers.
+- The explicit `--container-loopback` CLI switch supports insecure cookies only
+  for the local Docker mapping. Normal public binds still require a persistent
+  32-character secret and secure cookies.
+
 ## Key Files
 
 - `cloakbrowser/cloud/app.py`: API routes, authorization, audit, and workflows
@@ -268,6 +284,12 @@ CloakBrowser binary and the selected environment configuration.
   `b90c670` (`v0.5.8` wrapper plus the Chromium 151 banner update) while
   retaining the local Manager, Cloud control plane, Agent, and Workspace.
 - Cloud-focused suite: 49 passed.
+- Cloud Docker image integration passed on Linux for both deployment modes. The
+  container ran as UID 10001 with a read-only root filesystem, reached healthy
+  state through the published loopback ports, preserved its secret files and
+  data volume across a server redeploy, and left the existing production service
+  and unrelated containers running. Temporary test containers and volumes were
+  removed after verification.
 - Full non-slow repository suite: 944 passed, 42 deselected.
 - JavaScript suite: 596 passed, 11 skipped; TypeScript typecheck and build
   passed. The local machine did not have the .NET SDK, so .NET tests were not
