@@ -222,8 +222,8 @@ a monotonically increasing fencing token, so an expired process cannot overwrite
 a newer owner. The CLI refuses non-loopback plain HTTP URLs so Agent credentials
 cannot be sent to a remote server without TLS.
 
-An assigned Member runs a user-bound desktop node without receiving an
-organization-wide Agent token:
+An assigned Member or team Owner runs a user-bound desktop node without
+receiving an organization-wide Agent token:
 
 ```bash
 cloakbrowser client
@@ -234,11 +234,13 @@ Workspace UI, and accepts the email and password on that local page. The existin
 `workspace` command remains an alias, and `--cloud-url` or
 `CLOAKBROWSER_CLOUD_URL` can select another deployment. Members can start and
 stop assigned environments or create their own cloud-backed environment with a
-fingerprint and proxy. A self-created environment is always assigned to that Member in the
-device's organization; the server accepts only `backup` or `shared` storage and
-does not accept group, extension, or arbitrary membership IDs from the desktop
-client. Closing its browser uploads the complete encrypted profile through the
-same snapshot pipeline as an administrator-created environment.
+fingerprint and proxy. A Member's self-created environment is assigned to that
+Member. Owners can access all team environments, and an Owner-created environment
+starts unassigned so it can later be allocated from the cloud console. The server
+accepts only `backup` or `shared` storage and does not accept group, extension, or
+arbitrary membership IDs from the desktop client. Closing its browser uploads
+the complete encrypted profile through the same snapshot pipeline as an
+administrator-created environment.
 
 The local page never receives the returned `cb_device_` credential, snapshot
 key, or unmasked cloud proxy. Password and new-proxy forms post directly to the
@@ -267,8 +269,10 @@ allowlisted administrators, without public self-registration.
 Platform-created users start without a personal organization. A superadmin can
 open Team Access from the Platform Users view to add the account to any team,
 change its role, or remove its team access without switching organizations. Use
-the `member` role for desktop access, then assign cloud-backed environments to
-that membership from the environment editor. Platform superadmins can also
+the `member` role for assignment-scoped desktop access, then assign cloud-backed
+environments to that membership from the environment editor. Team Owners can
+also sign in from the desktop with organization-wide environment access.
+Platform superadmins can also
 deactivate/reactivate users and reset initial or forgotten passwords.
 Deactivation and password reset are rejected while any of the user's desktop
 devices holds an active environment lease. Once accepted, all browser sessions

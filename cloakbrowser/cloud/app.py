@@ -111,6 +111,7 @@ MAX_REQUEST_BYTES = 1024 * 1024
 AGENT_ONLINE_SECONDS = 45
 LEASE_TTL_SECONDS = 60
 TASK_CLAIM_TTL_SECONDS = 120
+DESKTOP_MEMBERSHIP_ROLES = frozenset({"member", "owner"})
 
 
 @dataclass
@@ -614,7 +615,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                         device.last_login_at
                         + timedelta(seconds=settings.device_session_ttl_seconds)
                     )
-                    or device.membership.role != "member"
+                    or device.membership.role not in DESKTOP_MEMBERSHIP_ROLES
                     or device.membership.user_id != device.user_id
                     or device.membership.organization_id != device.organization_id
                     or agent is None
@@ -635,20 +636,25 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="invalid agent credentials")
         return AgentAuthContext(agent=agent, raw_token=raw_token, device=device)
 
+    def device_environment_query(device: ClientDevice) -> Any:
+        query = select(Environment).where(
+            Environment.organization_id == device.organization_id
+        )
+        if device.membership.role == "member":
+            query = query.where(
+                Environment.assignments.any(
+                    EnvironmentAssignment.membership_id == device.membership_id
+                )
+            )
+        return query
+
     def client_session_result(
         db: DatabaseSession,
         device: ClientDevice,
         agent: AgentNode,
     ) -> dict[str, Any]:
         environments = db.scalars(
-            select(Environment)
-            .where(
-                Environment.organization_id == device.organization_id,
-                Environment.assignments.any(
-                    EnvironmentAssignment.membership_id == device.membership_id
-                ),
-            )
-            .order_by(Environment.updated_at.desc())
+            device_environment_query(device).order_by(Environment.updated_at.desc())
         ).all()
         return {
             "user": _user_json(device.user),
@@ -713,15 +719,14 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext,
         environment_id: str,
     ) -> Environment:
-        query = select(Environment).where(
-            Environment.id == environment_id,
-            Environment.organization_id == auth.agent.organization_id,
-        )
         if auth.device is not None:
-            query = query.where(
-                Environment.assignments.any(
-                    EnvironmentAssignment.membership_id == auth.device.membership_id
-                )
+            query = device_environment_query(auth.device).where(
+                Environment.id == environment_id
+            )
+        else:
+            query = select(Environment).where(
+                Environment.id == environment_id,
+                Environment.organization_id == auth.agent.organization_id,
             )
         environment = db.scalar(query)
         if environment is None:
@@ -907,14 +912,17 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         else:
             membership = next(
                 (item for item in memberships if item.role == "member"),
-                memberships[0] if memberships else None,
+                next(
+                    (item for item in memberships if item.role == "owner"),
+                    memberships[0] if memberships else None,
+                ),
             )
         if membership is None:
             raise HTTPException(status_code=403, detail="account does not belong to this team")
-        if membership.role != "member":
+        if membership.role not in DESKTOP_MEMBERSHIP_ROLES:
             raise HTTPException(
                 status_code=403,
-                detail="desktop access requires a member account",
+                detail="desktop access requires a member or owner account",
             )
 
         device = db.scalar(
@@ -1497,7 +1505,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         old_role = target.role
         retired_devices = 0
         unassigned_environments = 0
-        if old_role == "member" and payload.role != "member":
+        if (
+            old_role in DESKTOP_MEMBERSHIP_ROLES
+            and payload.role not in DESKTOP_MEMBERSHIP_ROLES
+        ):
             retired_devices = retire_member_devices(
                 db,
                 target.organization_id,
@@ -1507,6 +1518,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 ),
                 task_error="platform user role changed before the task completed",
             )
+        if old_role == "member" and payload.role != "member":
             unassigned = db.execute(
                 delete(EnvironmentAssignment).where(
                     EnvironmentAssignment.membership_id == target.id
@@ -1738,7 +1750,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         old_role = target.role
         retired_devices = 0
         unassigned_environments = 0
-        if old_role == "member" and payload.role != "member":
+        if (
+            old_role in DESKTOP_MEMBERSHIP_ROLES
+            and payload.role not in DESKTOP_MEMBERSHIP_ROLES
+        ):
             retired_devices = retire_member_devices(
                 db,
                 auth.organization.id,
@@ -1748,6 +1763,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 ),
                 task_error="member role changed before the task completed",
             )
+        if old_role == "member" and payload.role != "member":
             unassigned = db.execute(
                 delete(EnvironmentAssignment).where(
                     EnvironmentAssignment.membership_id == target.id
@@ -3340,18 +3356,17 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         auth: AgentAuthContext = Depends(current_agent),
         db: DatabaseSession = Depends(get_db),
     ) -> dict[str, Any]:
+        if auth.device is not None:
+            environment_query = device_environment_query(auth.device)
+        else:
+            environment_query = select(Environment).where(
+                Environment.organization_id == auth.agent.organization_id
+            )
         environment_query = (
-            select(Environment)
+            environment_query
             .options(joinedload(Environment.group))
-            .where(Environment.organization_id == auth.agent.organization_id)
             .order_by(Environment.updated_at.desc())
         )
-        if auth.device is not None:
-            environment_query = environment_query.where(
-                Environment.assignments.any(
-                    EnvironmentAssignment.membership_id == auth.device.membership_id
-                )
-            )
         environments = db.scalars(environment_query).all()
         return {"environments": [_environment_json(item) for item in environments]}
 
@@ -3390,14 +3405,15 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 environment.id,
                 payload.proxy,
             )
-        db.add(
-            EnvironmentAssignment(
-                environment_id=environment.id,
-                membership_id=device.membership_id,
-                organization_id=device.organization_id,
-                assigned_by=device.user_id,
+        if device.membership.role == "member":
+            db.add(
+                EnvironmentAssignment(
+                    environment_id=environment.id,
+                    membership_id=device.membership_id,
+                    organization_id=device.organization_id,
+                    assigned_by=device.user_id,
+                )
             )
-        )
         db.add(
             AuditLog(
                 organization_id=device.organization_id,
@@ -3410,7 +3426,7 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                     "storage_policy": environment.storage_policy,
                     "proxy_configured": bool(payload.proxy),
                     "extensions": 0,
-                    "assigned_members": 1,
+                    "assigned_members": int(device.membership.role == "member"),
                 },
             )
         )

@@ -1125,8 +1125,17 @@ def test_member_assignments_and_desktop_device_are_environment_scoped(cloud_app)
         assert updated_environment["assigned_membership_ids"] == []
 
 
-def test_client_login_requires_member_role(client):
-    register(client)
+def test_owner_can_use_desktop_client_for_all_team_environments(client):
+    owner_auth = register(client)
+    environment = client.post(
+        "/api/environments",
+        headers=csrf_headers(owner_auth),
+        json={
+            "name": "Owner Account",
+            "storage_policy": "shared",
+            "config": {"fingerprint_seed": 13579},
+        },
+    ).json()["environment"]
     response = client.post(
         "/api/client/login",
         json={
@@ -1136,8 +1145,54 @@ def test_client_login_requires_member_role(client):
             "device_name": "Owner Desktop",
         },
     )
-    assert response.status_code == 403
-    assert response.json()["detail"] == "desktop access requires a member account"
+    assert response.status_code == 200, response.text
+    signed_in = response.json()
+    assert signed_in["organization"]["role"] == "owner"
+    assert [item["id"] for item in signed_in["environments"]] == [environment["id"]]
+
+    device_auth = agent_headers(signed_in["device_token"])
+    restored = client.get("/api/client/session", headers=device_auth)
+    assert restored.status_code == 200, restored.text
+    listed = client.get("/api/agent/environments", headers=device_auth)
+    assert [item["id"] for item in listed.json()["environments"]] == [environment["id"]]
+
+    created = client.post(
+        "/api/agent/environments",
+        headers=device_auth,
+        json={
+            "name": "Owner Created",
+            "storage_policy": "shared",
+            "config": {"fingerprint_seed": 97531},
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["environment"]["assigned_membership_ids"] == []
+
+
+def test_client_login_rejects_non_desktop_roles(cloud_app):
+    with TestClient(cloud_app) as owner_client, TestClient(cloud_app) as viewer_client:
+        owner_auth = register(owner_client, "owner@example.com", "Owner", "Owner Team")
+        register(viewer_client, "viewer@example.com", "Viewer", "Viewer Team")
+        added = owner_client.post(
+            "/api/members",
+            headers=csrf_headers(owner_auth),
+            json={"email": "viewer@example.com", "role": "viewer"},
+        )
+        assert added.status_code == 201, added.text
+        response = viewer_client.post(
+            "/api/client/login",
+            json={
+                "email": "viewer@example.com",
+                "password": "correct-horse-battery-staple",
+                "organization_id": owner_auth["organization"]["id"],
+                "device_uid": str(uuid.uuid4()),
+                "device_name": "Viewer Desktop",
+            },
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == (
+            "desktop access requires a member or owner account"
+        )
 
 
 def test_desktop_device_session_restores_expires_and_logs_out(cloud_app):
