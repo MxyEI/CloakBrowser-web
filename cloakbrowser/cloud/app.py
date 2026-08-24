@@ -599,7 +599,9 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 .options(
                     joinedload(ClientDevice.agent),
                     joinedload(ClientDevice.user),
-                    joinedload(ClientDevice.membership),
+                    joinedload(ClientDevice.membership).joinedload(
+                        Membership.organization
+                    ),
                 )
                 .where(ClientDevice.token_digest == device_token_digest(raw_token))
             )
@@ -608,6 +610,10 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
                 device is not None
                 and (
                     not device.user.is_active
+                    or _session_expired(
+                        device.last_login_at
+                        + timedelta(seconds=settings.device_session_ttl_seconds)
+                    )
                     or device.membership.role != "member"
                     or device.membership.user_id != device.user_id
                     or device.membership.organization_id != device.organization_id
@@ -628,6 +634,35 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         if agent is None or agent.revoked_at is not None:
             raise HTTPException(status_code=401, detail="invalid agent credentials")
         return AgentAuthContext(agent=agent, raw_token=raw_token, device=device)
+
+    def client_session_result(
+        db: DatabaseSession,
+        device: ClientDevice,
+        agent: AgentNode,
+    ) -> dict[str, Any]:
+        environments = db.scalars(
+            select(Environment)
+            .where(
+                Environment.organization_id == device.organization_id,
+                Environment.assignments.any(
+                    EnvironmentAssignment.membership_id == device.membership_id
+                ),
+            )
+            .order_by(Environment.updated_at.desc())
+        ).all()
+        return {
+            "user": _user_json(device.user),
+            "organization": _organization_json(
+                device.membership.organization,
+                device.membership.role,
+            ),
+            "agent": _agent_json(agent),
+            "session_expires_at": _iso(
+                device.last_login_at
+                + timedelta(seconds=settings.device_session_ttl_seconds)
+            ),
+            "environments": [_environment_json(item) for item in environments],
+        }
 
     def permission(name: str, *, mutation: bool = False) -> Callable[..., AuthContext]:
         dependency = mutation_auth if mutation else current_auth
@@ -960,23 +995,40 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(status_code=409, detail="device registration conflicted") from exc
-        environments = db.scalars(
-            select(Environment)
-            .where(
-                Environment.organization_id == membership.organization_id,
-                Environment.assignments.any(
-                    EnvironmentAssignment.membership_id == membership.id
-                ),
-            )
-            .order_by(Environment.updated_at.desc())
-        ).all()
         return {
-            "user": _user_json(user),
-            "organization": _organization_json(membership.organization, membership.role),
-            "agent": _agent_json(agent),
+            **client_session_result(db, device, agent),
             "device_token": raw_token,
-            "environments": [_environment_json(item) for item in environments],
         }
+
+    @app.get("/api/client/session")
+    def client_session(
+        auth: AgentAuthContext = Depends(current_agent),
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        if auth.device is None:
+            raise HTTPException(status_code=403, detail="desktop device credentials required")
+        return client_session_result(db, auth.device, auth.agent)
+
+    @app.post("/api/client/logout", status_code=status.HTTP_204_NO_CONTENT)
+    def client_logout(
+        auth: AgentAuthContext = Depends(current_agent),
+        db: DatabaseSession = Depends(get_db),
+    ) -> Response:
+        if auth.device is None:
+            raise HTTPException(status_code=403, detail="desktop device credentials required")
+        auth.device.token_digest = device_token_digest(new_device_token())
+        db.add(
+            AuditLog(
+                organization_id=auth.device.organization_id,
+                actor_id=auth.device.user_id,
+                action="client_device.logged_out",
+                target_type="agent",
+                target_id=auth.agent.id,
+                details={"device_uid": auth.device.device_uid},
+            )
+        )
+        db.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
     def logout(

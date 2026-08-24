@@ -726,6 +726,7 @@ def main() -> None:
         "cloud": cmd_cloud,
         "agent": cmd_agent,
         "workspace": cmd_workspace,
+        "client": cmd_workspace,
         "login": cmd_login,
         "logout": cmd_logout,
     }

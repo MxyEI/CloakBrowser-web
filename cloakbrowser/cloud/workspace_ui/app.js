@@ -5,6 +5,8 @@ const dom = {
   appShell: document.querySelector("#appShell"),
   loginEmail: document.querySelector("#loginEmail"),
   loginOrganization: document.querySelector("#loginOrganization"),
+  loginButton: document.querySelector("#loginButton"),
+  loginStatus: document.querySelector("#loginStatus"),
   loginCloud: document.querySelector("#loginCloud"),
   loginError: document.querySelector("#loginError"),
   organizationName: document.querySelector("#organizationName"),
@@ -138,6 +140,8 @@ function render(state) {
     dom.loginEmail.value = dom.loginEmail.value || state.default_email || "";
     dom.loginOrganization.value = dom.loginOrganization.value || state.default_organization_id || "";
     dom.loginCloud.textContent = state.cloud_url || "";
+    dom.loginButton.disabled = Boolean(state.restoring_session);
+    setHidden(dom.loginStatus, !state.restoring_session);
     dom.loginError.textContent = state.last_error || "";
     setHidden(dom.loginError, !state.last_error);
     return;
@@ -210,7 +214,9 @@ async function boot() {
   csrfToken = session.csrf_token;
   render(session.state);
   pollTimer = window.setInterval(() => {
-    if (currentState && currentState.signed_in) loadState();
+    if (currentState && (currentState.signed_in || currentState.restoring_session)) {
+      loadState();
+    }
   }, 1200);
 }
 

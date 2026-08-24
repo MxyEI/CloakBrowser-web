@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import getpass
 import json
 import os
 import platform
+import stat
 import threading
 import uuid
 from pathlib import Path
@@ -15,24 +17,33 @@ from typing import Any, Optional
 import httpx
 
 from ..config import get_cache_dir
-from .agent_cli import DEFAULT_CLOUD_URL, heartbeat_payload, validate_cloud_url
+from .agent_cli import heartbeat_payload, validate_cloud_url
 from .agent_runtime import AgentRuntime, CloudAgentClient
+from .security import DEVICE_TOKEN_PREFIX
+
+
+DEFAULT_WORKSPACE_CLOUD_URL = "https://45-152-67-19.sslip.io:39177"
+WORKSPACE_SESSION_FILENAME = "session.json"
+WORKSPACE_SESSION_VERSION = 1
 
 
 def add_workspace_parser(subparsers: Any) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "workspace",
+        aliases=["client"],
         help="Sign in and run cloud environments assigned to this user",
     )
     parser.add_argument(
         "--cloud-url",
-        default=os.environ.get("CLOAKBROWSER_CLOUD_URL", DEFAULT_CLOUD_URL),
-        help=f"Cloud control-plane URL (default: {DEFAULT_CLOUD_URL})",
+        default=os.environ.get(
+            "CLOAKBROWSER_CLOUD_URL", DEFAULT_WORKSPACE_CLOUD_URL
+        ),
+        help=f"Cloud control-plane URL (default: {DEFAULT_WORKSPACE_CLOUD_URL})",
     )
     parser.add_argument(
         "--email",
         default=os.environ.get("CLOAKBROWSER_CLOUD_EMAIL", ""),
-        help="Cloud account email (prompted when omitted)",
+        help="Cloud account email (entered in the local page when omitted)",
     )
     parser.add_argument(
         "--organization-id",
@@ -116,6 +127,105 @@ def load_or_create_device_uid(root: Path) -> str:
     if os.name != "nt" and path.stat().st_mode & 0o077:
         raise ValueError(f"workspace device identity must use owner-only permissions: {path}")
     return device_uid
+
+
+def save_workspace_session(
+    root: Path,
+    cloud_url: str,
+    login: dict[str, Any],
+) -> None:
+    token = login.get("device_token")
+    expires_at = login.get("session_expires_at")
+    if (
+        not isinstance(token, str)
+        or not token.startswith(DEVICE_TOKEN_PREFIX)
+        or len(token) > 160
+        or not isinstance(expires_at, str)
+    ):
+        raise ValueError("cloud returned an invalid persistent device session")
+    try:
+        expiration = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("cloud returned an invalid device session expiry") from exc
+    if expiration.tzinfo is None or expiration <= datetime.now(timezone.utc):
+        raise ValueError("cloud returned an expired device session")
+
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    path = root / WORKSPACE_SESSION_FILENAME
+    temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
+    payload = {
+        "version": WORKSPACE_SESSION_VERSION,
+        "cloud_url": cloud_url,
+        "device_token": token,
+        "expires_at": expiration.astimezone(timezone.utc).isoformat(),
+    }
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def clear_workspace_session(root: Path) -> None:
+    (root / WORKSPACE_SESSION_FILENAME).unlink(missing_ok=True)
+
+
+def load_workspace_session(root: Path, cloud_url: str) -> Optional[dict[str, str]]:
+    path = root / WORKSPACE_SESSION_FILENAME
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"workspace session must be a regular file: {path}")
+        if os.name != "nt" and metadata.st_mode & 0o077:
+            raise ValueError(
+                f"workspace session must use owner-only permissions: {path}"
+            )
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            value = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"workspace session is invalid: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(value, dict) or value.get("version") != WORKSPACE_SESSION_VERSION:
+        raise ValueError(f"workspace session is invalid: {path}")
+    token = value.get("device_token")
+    expires_at = value.get("expires_at")
+    if (
+        value.get("cloud_url") != cloud_url
+        or not isinstance(token, str)
+        or not token.startswith(DEVICE_TOKEN_PREFIX)
+        or len(token) > 160
+        or not isinstance(expires_at, str)
+    ):
+        clear_workspace_session(root)
+        return None
+    try:
+        expiration = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        clear_workspace_session(root)
+        return None
+    if expiration.tzinfo is None or expiration <= datetime.now(timezone.utc):
+        clear_workspace_session(root)
+        return None
+    return {"device_token": token, "expires_at": expires_at}
 
 
 def login_device(

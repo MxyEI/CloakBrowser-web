@@ -58,6 +58,9 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .login-form h2 { margin: 0 0 24px; font-size: 20px; letter-spacing: 0; }
 .login-form label, .environment-form label { display: grid; gap: 7px; margin-bottom: 16px; }
 label > span, legend { color: #555e58; font-size: 12px; font-weight: 650; }
+.login-form .remember-row { display: flex; align-items: center; gap: 9px; }
+.remember-row input { width: 16px; min-height: 16px; margin: 0; accent-color: #176b46; }
+.login-status { margin: 14px 0 0; color: #59615c; font-size: 12px; text-align: center; }
 
 input, select {
   width: 100%;

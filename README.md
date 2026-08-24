@@ -226,13 +226,15 @@ An assigned Member runs a user-bound desktop node without receiving an
 organization-wide Agent token:
 
 ```bash
-cloakbrowser workspace --cloud-url https://cloud.example.com --email member@example.com
+cloakbrowser client
 ```
 
-The command opens a loopback Workspace UI, signs in through its local Python
-service, and registers the current device. Members can start and stop assigned
-environments or create their own cloud-backed environment with a fingerprint and
-proxy. A self-created environment is always assigned to that Member in the
+The client defaults to the deployed CloakBrowser Cloud service, opens a loopback
+Workspace UI, and accepts the email and password on that local page. The existing
+`workspace` command remains an alias, and `--cloud-url` or
+`CLOAKBROWSER_CLOUD_URL` can select another deployment. Members can start and
+stop assigned environments or create their own cloud-backed environment with a
+fingerprint and proxy. A self-created environment is always assigned to that Member in the
 device's organization; the server accepts only `backup` or `shared` storage and
 does not accept group, extension, or arbitrary membership IDs from the desktop
 client. Closing its browser uploads the complete encrypted profile through the
@@ -240,12 +242,13 @@ same snapshot pipeline as an administrator-created environment.
 
 The local page never receives the returned `cb_device_` credential, snapshot
 key, or unmasked cloud proxy. Password and new-proxy forms post directly to the
-loopback Python service instead of being read by the Workspace JavaScript. Only
-a random device UUID is stored under `~/.cloakbrowser/cloud-workspace` with
-owner-only permissions. A new login rotates the previous device credential.
-Plain HTTP is accepted only for loopback development URLs. Use `--cli` for the
-terminal `launch`, `stop`, and `list` fallback, or `--once` to sign in, list, and
-exit.
+loopback Python service instead of being read by the Workspace JavaScript. By
+default, an owner-only session file under `~/.cloakbrowser/cloud-workspace`
+keeps the device signed in for 30 days; the password is never stored. The server
+enforces the same expiry, and signing out rotates the server credential and
+removes the local session. Closing the client preserves the session. Plain HTTP
+is accepted only for loopback development URLs. Use `--cli` for the terminal
+`launch`, `stop`, and `list` fallback, or `--once` to sign in, list, and exit.
 
 Platform operators can grant cross-organization superadmin access with a
 deployment-controlled email allowlist. A matching active account can discover

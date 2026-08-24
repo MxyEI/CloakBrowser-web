@@ -91,6 +91,7 @@ class CloudSettings:
     secret_key: str
     cookie_secure: bool = False
     session_ttl_seconds: int = 7 * 24 * 60 * 60
+    device_session_ttl_seconds: int = 30 * 24 * 60 * 60
     assets_dir: Optional[Path] = None
     development_secret: bool = False
     snapshot_dir: Optional[Path] = None
@@ -134,6 +135,19 @@ class CloudSettings:
             ) from exc
         secure = os.environ.get("CLOAKBROWSER_CLOUD_COOKIE_SECURE", "").strip().lower()
         cookie_secure = secure in {"1", "true", "yes", "on"}
+        raw_device_session_days = os.environ.get(
+            "CLOAKBROWSER_CLOUD_DEVICE_SESSION_DAYS", "30"
+        ).strip()
+        try:
+            device_session_days = int(raw_device_session_days)
+        except ValueError as exc:
+            raise ValueError(
+                "CLOAKBROWSER_CLOUD_DEVICE_SESSION_DAYS must be an integer"
+            ) from exc
+        if not 1 <= device_session_days <= 365:
+            raise ValueError(
+                "CLOAKBROWSER_CLOUD_DEVICE_SESSION_DAYS must be between 1 and 365"
+            )
         raw_max_snapshot_mb = os.environ.get(
             "CLOAKBROWSER_CLOUD_MAX_SNAPSHOT_MB", "1024"
         ).strip()
@@ -181,6 +195,7 @@ class CloudSettings:
             database_url=database_url,
             secret_key=secret_key,
             cookie_secure=cookie_secure,
+            device_session_ttl_seconds=device_session_days * 24 * 60 * 60,
             development_secret=development_secret,
             snapshot_dir=root / "snapshots",
             snapshot_master_key=_load_or_create_master_key(root),

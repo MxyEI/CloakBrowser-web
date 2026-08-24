@@ -16,8 +16,14 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .agent_cli import heartbeat_payload
-from .agent_runtime import AgentRuntime, CloudAgentClient
-from .workspace_cli import load_or_create_device_uid, login_device
+from .agent_runtime import AgentAPIError, AgentRuntime, CloudAgentClient
+from .workspace_cli import (
+    clear_workspace_session,
+    load_or_create_device_uid,
+    load_workspace_session,
+    login_device,
+    save_workspace_session,
+)
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -55,7 +61,7 @@ class WorkspaceApplication:
         self.csrf_token = secrets.token_urlsafe(32)
         self.assets_dir = Path(__file__).with_name("workspace_ui")
         self._lock = threading.RLock()
-        self._operation_lock = threading.Lock()
+        self._operation_lock = threading.RLock()
         self._api: Optional[CloudAgentClient] = None
         self._runtime: Optional[AgentRuntime] = None
         self._runtime_thread: Optional[threading.Thread] = None
@@ -65,6 +71,14 @@ class WorkspaceApplication:
         self._last_error = ""
         self._connection_message = ""
         self._last_refresh = 0.0
+        self._remember_session = False
+        self._saved_session: Optional[dict[str, str]] = None
+        self._restoring_session = False
+        try:
+            self._saved_session = load_workspace_session(root, cloud_url)
+            self._restoring_session = self._saved_session is not None
+        except Exception as exc:
+            self._set_error(exc)
 
     def _set_error(self, error: Exception | str) -> None:
         message = str(error).strip()[:1000] or "request failed"
@@ -97,58 +111,52 @@ class WorkspaceApplication:
                 **public_details,
             }
 
-    def login(self, email: str, password: str, organization_id: str = "") -> None:
-        email = email.strip()
-        if not email or not password:
-            raise WorkspaceError("email and password are required")
-        with self._operation_lock:
-            self.logout()
-            result = login_device(
-                self.cloud_url,
-                email=email,
-                password=password,
-                organization_id=(organization_id or self.default_organization_id).strip(),
-                device_uid=self.device_uid,
-                device_name=self.device_name,
-            )
-            api = CloudAgentClient(self.cloud_url, result["device_token"])
-            runtime = AgentRuntime(
-                api,
-                self.root,
-                heartbeat_payload=heartbeat_payload(),
-                poll_interval=self.poll_interval,
-                heartbeat_interval=20.0,
-                reporter=self._report,
-                state_reporter=self._report_environment_state,
-            )
-            runtime_thread = threading.Thread(
-                target=runtime.run,
-                name="cloak-cloud-workspace",
-                daemon=True,
-            )
-            with self._lock:
-                self._api = api
-                self._runtime = runtime
-                self._runtime_thread = runtime_thread
-                self._identity = {
-                    "user": dict(result.get("user") or {}),
-                    "organization": dict(result.get("organization") or {}),
-                    "agent": dict(result.get("agent") or {}),
+    def _activate_session(
+        self,
+        api: CloudAgentClient,
+        result: dict[str, Any],
+        *,
+        remember: bool,
+    ) -> None:
+        runtime = AgentRuntime(
+            api,
+            self.root,
+            heartbeat_payload=heartbeat_payload(),
+            poll_interval=self.poll_interval,
+            heartbeat_interval=20.0,
+            reporter=self._report,
+            state_reporter=self._report_environment_state,
+        )
+        runtime_thread = threading.Thread(
+            target=runtime.run,
+            name="cloak-cloud-workspace",
+            daemon=True,
+        )
+        with self._lock:
+            self._api = api
+            self._runtime = runtime
+            self._runtime_thread = runtime_thread
+            self._identity = {
+                "user": dict(result.get("user") or {}),
+                "organization": dict(result.get("organization") or {}),
+                "agent": dict(result.get("agent") or {}),
+            }
+            self._environments = list(result["environments"])
+            self._environment_states = {
+                str(environment["id"]): {
+                    "phase": "idle",
+                    "updated_at": _now_iso(),
                 }
-                self._environments = list(result["environments"])
-                self._environment_states = {
-                    str(environment["id"]): {
-                        "phase": "idle",
-                        "updated_at": _now_iso(),
-                    }
-                    for environment in self._environments
-                }
-                self._last_error = ""
-                self._connection_message = "Connecting"
-                self._last_refresh = time.monotonic()
-            runtime_thread.start()
+                for environment in self._environments
+            }
+            self._last_error = ""
+            self._connection_message = "Connecting"
+            self._last_refresh = time.monotonic()
+            self._remember_session = remember
+            self._restoring_session = False
+        runtime_thread.start()
 
-    def logout(self) -> None:
+    def _stop_runtime(self, *, revoke: bool) -> None:
         with self._lock:
             runtime = self._runtime
             runtime_thread = self._runtime_thread
@@ -166,7 +174,97 @@ class WorkspaceApplication:
         if runtime_thread is not None and runtime_thread is not threading.current_thread():
             runtime_thread.join(timeout=35.0)
         if api is not None:
+            if revoke:
+                try:
+                    api.logout_device()
+                except Exception:
+                    pass
             api.close()
+
+    def restore_saved_session(self) -> None:
+        with self._operation_lock:
+            session = self._saved_session
+            if session is None or self._api is not None:
+                with self._lock:
+                    self._restoring_session = False
+                return
+            api = CloudAgentClient(self.cloud_url, session["device_token"])
+            try:
+                result = api.client_session()
+            except AgentAPIError as exc:
+                api.close()
+                if exc.status_code == HTTPStatus.UNAUTHORIZED:
+                    clear_workspace_session(self.root)
+                    self._saved_session = None
+                    self._set_error("saved session expired; sign in again")
+                else:
+                    self._set_error(exc)
+                with self._lock:
+                    self._restoring_session = False
+                return
+            except Exception as exc:
+                api.close()
+                self._set_error(exc)
+                with self._lock:
+                    self._restoring_session = False
+                return
+            self._activate_session(api, result, remember=True)
+
+    def login(
+        self,
+        email: str,
+        password: str,
+        organization_id: str = "",
+        *,
+        remember: bool = True,
+    ) -> None:
+        email = email.strip()
+        if not email or not password:
+            raise WorkspaceError("email and password are required")
+        with self._operation_lock:
+            self._stop_runtime(revoke=True)
+            clear_workspace_session(self.root)
+            self._saved_session = None
+            result = login_device(
+                self.cloud_url,
+                email=email,
+                password=password,
+                organization_id=(organization_id or self.default_organization_id).strip(),
+                device_uid=self.device_uid,
+                device_name=self.device_name,
+            )
+            api = CloudAgentClient(self.cloud_url, result["device_token"])
+            try:
+                if remember:
+                    save_workspace_session(self.root, self.cloud_url, result)
+                    self._saved_session = {
+                        "device_token": result["device_token"],
+                        "expires_at": result["session_expires_at"],
+                    }
+                self._activate_session(api, result, remember=remember)
+            except Exception:
+                try:
+                    api.logout_device()
+                except Exception:
+                    pass
+                api.close()
+                clear_workspace_session(self.root)
+                self._saved_session = None
+                raise
+
+    def logout(self) -> None:
+        with self._operation_lock:
+            self._stop_runtime(revoke=True)
+            clear_workspace_session(self.root)
+            self._saved_session = None
+            with self._lock:
+                self._remember_session = False
+                self._restoring_session = False
+                self._last_error = ""
+
+    def close(self) -> None:
+        with self._operation_lock:
+            self._stop_runtime(revoke=not self._remember_session)
 
     def _require_api(self) -> CloudAgentClient:
         with self._lock:
@@ -246,6 +344,7 @@ class WorkspaceApplication:
             signed_in = self._api is not None
             return {
                 "signed_in": signed_in,
+                "restoring_session": self._restoring_session,
                 "cloud_url": self.cloud_url,
                 "default_email": self.default_email,
                 "default_organization_id": self.default_organization_id,
@@ -292,12 +391,15 @@ class _WorkspaceRequestHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(origin)
             host = urlparse(f"http://{self.headers.get('Host', '')}")
+            origin_port = parsed.port
+            host_port = host.port
         except ValueError:
             return False
         return (
             parsed.scheme == "http"
             and parsed.hostname in LOOPBACK_HOSTS
-            and parsed.netloc == host.netloc
+            and host.hostname in LOOPBACK_HOSTS
+            and origin_port == host_port
         )
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
@@ -506,6 +608,7 @@ class _WorkspaceRequestHandler(BaseHTTPRequestHandler):
                             form.get("email", ""),
                             form.get("password", ""),
                             form.get("organization_id", ""),
+                            remember=form.get("remember") == "1",
                         )
                     except Exception as exc:
                         self.app._set_error(exc)
@@ -579,6 +682,12 @@ def run_workspace(
     print(f"CloakBrowser Workspace: {url}")
     print(f"Cloud control plane: {cloud_url}")
     print(f"Workspace data: {root}")
+    restore_thread = threading.Thread(
+        target=app.restore_saved_session,
+        name="cloak-workspace-session-restore",
+        daemon=True,
+    )
+    restore_thread.start()
     if open_browser:
         timer = threading.Timer(0.25, webbrowser.open, args=(url,))
         timer.daemon = True
@@ -587,4 +696,4 @@ def run_workspace(
         server.serve_forever(poll_interval=0.25)
     finally:
         server.server_close()
-        app.logout()
+        app.close()

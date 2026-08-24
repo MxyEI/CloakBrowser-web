@@ -236,6 +236,7 @@ CloakBrowser binary and the selected environment configuration.
 - `CLOAKBROWSER_CLOUD_DATABASE_URL`
 - `CLOAKBROWSER_CLOUD_SECRET`
 - `CLOAKBROWSER_CLOUD_COOKIE_SECURE`
+- `CLOAKBROWSER_CLOUD_DEVICE_SESSION_DAYS` (default 30, allowed 1-365)
 - `CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS` (comma-separated platform account emails)
 - `CLOAKBROWSER_CLOUD_SNAPSHOT_KEY`
 - `CLOAKBROWSER_CLOUD_MAX_SNAPSHOT_MB` (default 1024 MiB)
@@ -243,7 +244,8 @@ CloakBrowser binary and the selected environment configuration.
 - `CLOAKBROWSER_CLOUD_MAX_EXTENSION_MB` (default 100 MiB)
 - `CLOAKBROWSER_CLOUD_ORG_EXTENSION_QUOTA_MB` (default 5120 MiB)
 - `CLOAKBROWSER_CLOUD_LOG_LEVEL`
-- `CLOAKBROWSER_CLOUD_URL` and `CLOAKBROWSER_AGENT_TOKEN` for Agents
+- `CLOAKBROWSER_CLOUD_URL` for client/Agent endpoint overrides
+- `CLOAKBROWSER_AGENT_TOKEN` for Agents
 
 ## Docker Deployment
 

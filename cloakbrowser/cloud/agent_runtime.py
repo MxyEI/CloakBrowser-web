@@ -194,6 +194,15 @@ class CloudAgentClient:
     def heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/agent/heartbeat", payload)
 
+    def client_session(self) -> dict[str, Any]:
+        response = self._request("GET", "/api/client/session")
+        if not isinstance(response.get("environments"), list):
+            raise AgentAPIError("cloud returned an invalid device session")
+        return response
+
+    def logout_device(self) -> None:
+        self._request("POST", "/api/client/logout")
+
     def list_environments(self) -> list[dict[str, Any]]:
         response = self._request("GET", "/api/agent/environments")
         environments = response.get("environments")

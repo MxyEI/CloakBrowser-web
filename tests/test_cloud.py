@@ -6,14 +6,15 @@ from argparse import Namespace
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from datetime import timedelta
+from datetime import datetime, timedelta
 import hashlib
+import httpx
 import json
 import os
 from pathlib import Path
 import platform
 import stat
-from threading import Barrier
+from threading import Barrier, Thread
 import uuid
 import zipfile
 
@@ -27,7 +28,7 @@ from cloakbrowser.cloud import workspace_app
 from cloakbrowser.cloud import workspace_cli
 from cloakbrowser.cloud.agent_runtime import AgentRuntime
 from cloakbrowser.cloud.cli import add_cloud_parser
-from cloakbrowser.cloud.models import EnvironmentSecret, RemoteTask, utc_now
+from cloakbrowser.cloud.models import ClientDevice, EnvironmentSecret, RemoteTask, utc_now
 from cloakbrowser.cloud.settings import CloudSettings
 from cloakbrowser.cloud.snapshot_crypto import (
     SnapshotError,
@@ -1139,6 +1140,61 @@ def test_client_login_requires_member_role(client):
     assert response.json()["detail"] == "desktop access requires a member account"
 
 
+def test_desktop_device_session_restores_expires_and_logs_out(cloud_app):
+    with TestClient(cloud_app) as owner_client, TestClient(cloud_app) as member_client:
+        owner_auth = register(owner_client, "owner@example.com", "Owner", "Owner Team")
+        register(member_client, "member@example.com", "Member", "Personal")
+        membership = owner_client.post(
+            "/api/members",
+            headers=csrf_headers(owner_auth),
+            json={"email": "member@example.com", "role": "member"},
+        )
+        assert membership.status_code == 201, membership.text
+        device_uid = str(uuid.uuid4())
+        payload = {
+            "email": "member@example.com",
+            "password": "correct-horse-battery-staple",
+            "organization_id": owner_auth["organization"]["id"],
+            "device_uid": device_uid,
+            "device_name": "Remembered Desktop",
+        }
+        signed_in = member_client.post("/api/client/login", json=payload)
+        assert signed_in.status_code == 200, signed_in.text
+        session = signed_in.json()
+        token = session["device_token"]
+        expires_at = datetime.fromisoformat(session["session_expires_at"])
+        assert timedelta(days=29) < expires_at - utc_now() <= timedelta(days=30)
+
+        restored = member_client.get(
+            "/api/client/session", headers=agent_headers(token)
+        )
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["user"]["email"] == "member@example.com"
+        assert restored.json()["organization"]["id"] == owner_auth["organization"]["id"]
+        assert "device_token" not in restored.json()
+
+        with cloud_app.state.session_factory() as db:
+            device = db.scalar(
+                select(ClientDevice).where(ClientDevice.device_uid == device_uid)
+            )
+            assert device is not None
+            device.last_login_at = utc_now() - timedelta(days=31)
+            db.commit()
+        assert member_client.get(
+            "/api/client/session", headers=agent_headers(token)
+        ).status_code == 401
+
+        signed_in = member_client.post("/api/client/login", json=payload)
+        replacement = signed_in.json()["device_token"]
+        logged_out = member_client.post(
+            "/api/client/logout", headers=agent_headers(replacement)
+        )
+        assert logged_out.status_code == 204, logged_out.text
+        assert member_client.get(
+            "/api/client/session", headers=agent_headers(replacement)
+        ).status_code == 401
+
+
 def test_desktop_member_can_create_self_assigned_cloud_environment(
     cloud_app, tmp_path
 ):
@@ -1424,10 +1480,12 @@ def test_cloud_settings_parse_superadmin_email_allowlist(tmp_path, monkeypatch):
         "CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS",
         " Root@Example.COM, ops@example.com ",
     )
+    monkeypatch.setenv("CLOAKBROWSER_CLOUD_DEVICE_SESSION_DAYS", "45")
     settings = CloudSettings.from_env(str(tmp_path / "valid-superadmins"))
     assert settings.superadmin_emails == frozenset(
         {"root@example.com", "ops@example.com"}
     )
+    assert settings.device_session_ttl_seconds == 45 * 24 * 60 * 60
 
     monkeypatch.setenv(
         "CLOAKBROWSER_CLOUD_SUPERADMIN_EMAILS",
@@ -1489,12 +1547,79 @@ def test_workspace_cli_parser_and_private_device_identity(tmp_path):
     )
     assert args.command == "workspace"
     assert args.once is True
+    client_args = parser.parse_args(["client", "--no-open"])
+    assert client_args.command == "client"
+    assert client_args.cloud_url == workspace_cli.DEFAULT_WORKSPACE_CLOUD_URL
     root = tmp_path / "workspace"
     first = workspace_cli.load_or_create_device_uid(root)
     second = workspace_cli.load_or_create_device_uid(root)
     assert first == second == str(uuid.UUID(first))
     if os.name != "nt":
         assert (root / "device.json").stat().st_mode & 0o077 == 0
+
+
+def test_workspace_saved_session_is_private_and_expires_locally(tmp_path):
+    root = tmp_path / "workspace"
+    cloud_url = "https://cloud.example.com"
+    login = {
+        "device_token": "cb_device_" + "x" * 48,
+        "session_expires_at": (utc_now() + timedelta(days=30)).isoformat(),
+    }
+    workspace_cli.save_workspace_session(root, cloud_url, login)
+    restored = workspace_cli.load_workspace_session(root, cloud_url)
+    assert restored is not None
+    assert restored["device_token"] == login["device_token"]
+    session_path = root / workspace_cli.WORKSPACE_SESSION_FILENAME
+    if os.name != "nt":
+        assert session_path.stat().st_mode & 0o077 == 0
+
+    saved = json.loads(session_path.read_text(encoding="utf-8"))
+    saved["expires_at"] = (utc_now() - timedelta(seconds=1)).isoformat()
+    session_path.write_text(json.dumps(saved), encoding="utf-8")
+    session_path.chmod(0o600)
+    assert workspace_cli.load_workspace_session(root, cloud_url) is None
+    assert not session_path.exists()
+
+
+def test_workspace_ui_polls_while_restoring_saved_session():
+    root = Path(__file__).parents[1] / "cloakbrowser" / "cloud" / "workspace_ui"
+    html = (root / "index.html").read_text(encoding="utf-8")
+    javascript = (root / "app.js").read_text(encoding="utf-8")
+    assert 'name="remember" type="checkbox" value="1" checked' in html
+    assert "currentState.signed_in || currentState.restoring_session" in javascript
+
+
+def test_workspace_accepts_loopback_origin_alias_on_same_port(tmp_path):
+    app = workspace_app.WorkspaceApplication(
+        "https://cloud.example.com",
+        tmp_path / "workspace",
+    )
+    server = workspace_app._WorkspaceHTTPServer(("127.0.0.1", 0), app)
+    port = server.server_address[1]
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with httpx.Client(trust_env=False) as client:
+            alias_response = client.post(
+                f"http://127.0.0.1:{port}/api/login",
+                headers={"Origin": f"http://localhost:{port}"},
+                data={"csrf_token": "invalid"},
+            )
+            assert alias_response.status_code == 403
+            assert alias_response.json()["error"] == "invalid session token"
+
+            external_response = client.post(
+                f"http://127.0.0.1:{port}/api/login",
+                headers={"Origin": "https://example.com"},
+                data={"csrf_token": "invalid"},
+            )
+            assert external_response.status_code == 403
+            assert external_response.json()["error"] == "request origin is not allowed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+        app.close()
 
 
 def test_workspace_application_keeps_credentials_out_of_public_state(
@@ -1510,8 +1635,26 @@ def test_workspace_application_keeps_credentials_out_of_public_state(
             self.token = token
             self.created_payload = None
             self.closed = False
+            self.logged_out = False
             self.environments = []
             self.__class__.instance = self
+
+        def client_session(self):
+            return {
+                "session_expires_at": (utc_now() + timedelta(days=30)).isoformat(),
+                "user": {
+                    "id": str(uuid.uuid4()),
+                    "email": "member@example.com",
+                    "display_name": "Member",
+                },
+                "organization": {
+                    "id": str(uuid.uuid4()),
+                    "name": "Cloud Team",
+                    "role": "member",
+                },
+                "agent": {"id": str(uuid.uuid4()), "name": "Member Desktop"},
+                "environments": [],
+            }
 
         def list_environments(self):
             return list(self.environments)
@@ -1540,6 +1683,9 @@ def test_workspace_application_keeps_credentials_out_of_public_state(
             assert requested_id == environment_id
             return {"task": {"id": str(uuid.uuid4())}}
 
+        def logout_device(self):
+            self.logged_out = True
+
         def close(self):
             self.closed = True
 
@@ -1558,6 +1704,7 @@ def test_workspace_application_keeps_credentials_out_of_public_state(
     def fake_login_device(*_args, **_kwargs):
         return {
             "device_token": "cb_device_private-token-material",
+            "session_expires_at": (utc_now() + timedelta(days=30)).isoformat(),
             "user": {
                 "id": str(uuid.uuid4()),
                 "email": "member@example.com",
@@ -1605,8 +1752,24 @@ def test_workspace_application_keeps_credentials_out_of_public_state(
     assert "cb_device_" not in public_json
     assert "proxy-password" not in public_json
     assert "http://***@proxy.example:8080" in public_json
-    app.logout()
+    session_path = tmp_path / "workspace" / workspace_cli.WORKSPACE_SESSION_FILENAME
+    app.close()
     assert api.closed is True
+    assert api.logged_out is False
+    assert session_path.exists()
+
+    restored_app = workspace_app.WorkspaceApplication(
+        "https://cloud.example.com",
+        tmp_path / "workspace",
+    )
+    assert restored_app.public_state()["restoring_session"] is True
+    restored_app.restore_saved_session()
+    assert restored_app.public_state()["signed_in"] is True
+    restored_api = FakeWorkspaceClient.instance
+    restored_app.logout()
+    assert restored_api.logged_out is True
+    assert restored_api.closed is True
+    assert not session_path.exists()
 
 
 def create_agent(client, auth, name="Runner One"):
