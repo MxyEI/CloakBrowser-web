@@ -1709,7 +1709,7 @@ def test_workspace_ui_polls_while_restoring_saved_session():
     assert "currentState.signed_in || currentState.restoring_session" in javascript
 
 
-def test_workspace_accepts_loopback_origin_alias_on_same_port(tmp_path):
+def test_workspace_accepts_compatible_loopback_origins(tmp_path):
     app = workspace_app.WorkspaceApplication(
         "https://cloud.example.com",
         tmp_path / "workspace",
@@ -1749,9 +1749,17 @@ def test_workspace_accepts_loopback_origin_alias_on_same_port(tmp_path):
             assert external_response.status_code == 403
             assert external_response.json()["error"] == "request origin is not allowed"
 
+            opaque_origin_response = client.post(
+                f"http://127.0.0.1:{port}/api/login",
+                headers={"Origin": "null"},
+                data={"csrf_token": "invalid"},
+            )
+            assert opaque_origin_response.status_code == 403
+            assert opaque_origin_response.json()["error"] == "invalid session token"
+
             registered = client.post(
                 f"http://127.0.0.1:{port}/api/register",
-                headers={"Origin": f"http://localhost:{port}"},
+                headers={"Origin": "null"},
                 data={
                     "csrf_token": app.csrf_token,
                     "email": "new@example.com",

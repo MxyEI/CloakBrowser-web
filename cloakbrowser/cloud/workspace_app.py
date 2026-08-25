@@ -427,7 +427,10 @@ class _WorkspaceRequestHandler(BaseHTTPRequestHandler):
 
     def _origin_allowed(self) -> bool:
         origin = self.headers.get("Origin")
-        if not origin:
+        # Some desktop browsers serialize an opaque local-page origin as
+        # ``null``. Treat it like an omitted Origin; loopback Host validation
+        # and the per-process CSRF token still gate every mutation.
+        if not origin or origin == "null":
             return True
         try:
             parsed = urlparse(origin)
