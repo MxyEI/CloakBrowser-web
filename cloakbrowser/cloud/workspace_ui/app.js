@@ -3,11 +3,17 @@
 const dom = {
   loginShell: document.querySelector("#loginShell"),
   appShell: document.querySelector("#appShell"),
+  authModeButtons: document.querySelectorAll("button[data-auth-mode]"),
+  loginForm: document.querySelector("#loginForm"),
+  registerForm: document.querySelector("#registerForm"),
   loginEmail: document.querySelector("#loginEmail"),
+  registerEmail: document.querySelector("#registerEmail"),
   loginOrganization: document.querySelector("#loginOrganization"),
   loginButton: document.querySelector("#loginButton"),
+  registerButton: document.querySelector("#registerButton"),
   loginStatus: document.querySelector("#loginStatus"),
   loginCloud: document.querySelector("#loginCloud"),
+  loginNotice: document.querySelector("#loginNotice"),
   loginError: document.querySelector("#loginError"),
   organizationName: document.querySelector("#organizationName"),
   userName: document.querySelector("#userName"),
@@ -53,6 +59,15 @@ function text(value) {
 
 function setHidden(element, hidden) {
   element.hidden = hidden;
+}
+
+function selectAuthMode(mode) {
+  const register = mode === "register";
+  setHidden(dom.loginForm, register);
+  setHidden(dom.registerForm, !register);
+  dom.authModeButtons.forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.authMode === mode));
+  });
 }
 
 function phaseClass(phase) {
@@ -138,10 +153,17 @@ function render(state) {
 
   if (!state.signed_in) {
     dom.loginEmail.value = dom.loginEmail.value || state.default_email || "";
+    dom.registerEmail.value = dom.registerEmail.value || state.default_email || "";
     dom.loginOrganization.value = dom.loginOrganization.value || state.default_organization_id || "";
     dom.loginCloud.textContent = state.cloud_url || "";
     dom.loginButton.disabled = Boolean(state.restoring_session);
+    dom.registerButton.disabled = Boolean(state.restoring_session);
+    dom.authModeButtons.forEach((button) => {
+      button.disabled = Boolean(state.restoring_session);
+    });
     setHidden(dom.loginStatus, !state.restoring_session);
+    dom.loginNotice.textContent = state.last_notice || "";
+    setHidden(dom.loginNotice, !state.last_notice);
     dom.loginError.textContent = state.last_error || "";
     setHidden(dom.loginError, !state.last_error);
     return;
@@ -200,6 +222,9 @@ dom.environmentRows.addEventListener("click", (event) => {
   mutate(`/api/environments/${encodeURIComponent(button.dataset.environmentId)}/${button.dataset.action}`);
 });
 
+dom.authModeButtons.forEach((button) => {
+  button.addEventListener("click", () => selectAuthMode(button.dataset.authMode));
+});
 dom.createButton.addEventListener("click", () => dom.createDialog.showModal());
 dom.closeCreateButton.addEventListener("click", () => dom.createDialog.close());
 dom.cancelCreateButton.addEventListener("click", () => dom.createDialog.close());
@@ -210,6 +235,8 @@ dom.logoutButton.addEventListener("click", async () => {
 });
 
 async function boot() {
+  const requestedMode = new URLSearchParams(window.location.search).get("mode");
+  selectAuthMode(requestedMode === "register" ? "register" : "login");
   const session = await request("/api/session");
   csrfToken = session.csrf_token;
   render(session.state);

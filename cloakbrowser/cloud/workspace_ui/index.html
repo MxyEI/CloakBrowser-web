@@ -17,30 +17,58 @@
           <p>Workspace</p>
         </div>
       </div>
-      <form class="login-form" method="post" action="/api/login" autocomplete="on">
-        <input class="csrf-field" type="hidden" name="csrf_token">
-        <h2>Sign in</h2>
-        <label>
-          <span>Email</span>
-          <input id="loginEmail" name="email" type="email" autocomplete="username" required>
-        </label>
-        <label>
-          <span>Password</span>
-          <input name="password" type="password" autocomplete="current-password" required>
-        </label>
-        <label>
-          <span>Team ID</span>
-          <input id="loginOrganization" name="organization_id" autocomplete="off" placeholder="Optional">
-        </label>
-        <label class="remember-row">
-          <input name="remember" type="checkbox" value="1" checked>
-          <span>Keep me signed in for 30 days</span>
-        </label>
-        <button id="loginButton" class="primary wide" type="submit">Sign in</button>
+      <div class="login-card">
+        <div class="auth-tabs" role="tablist" aria-label="Account access">
+          <button type="button" data-auth-mode="login" role="tab" aria-selected="true">Sign in</button>
+          <button type="button" data-auth-mode="register" role="tab" aria-selected="false">Register</button>
+        </div>
+        <form id="loginForm" class="auth-form" method="post" action="/api/login" autocomplete="on">
+          <input class="csrf-field" type="hidden" name="csrf_token">
+          <h2>Sign in</h2>
+          <label>
+            <span>Email</span>
+            <input id="loginEmail" name="email" type="email" autocomplete="username" maxlength="254" required>
+          </label>
+          <label>
+            <span>Password</span>
+            <input name="password" type="password" autocomplete="current-password" maxlength="128" required>
+          </label>
+          <label>
+            <span>Team ID</span>
+            <input id="loginOrganization" name="organization_id" autocomplete="off" maxlength="36" placeholder="Optional">
+          </label>
+          <label class="remember-row">
+            <input name="remember" type="checkbox" value="1" checked>
+            <span>Keep me signed in for 30 days</span>
+          </label>
+          <button id="loginButton" class="primary wide" type="submit">Sign in</button>
+        </form>
+        <form id="registerForm" class="auth-form" method="post" action="/api/register" autocomplete="on" hidden>
+          <input class="csrf-field" type="hidden" name="csrf_token">
+          <h2>Create account</h2>
+          <label>
+            <span>Name</span>
+            <input name="display_name" autocomplete="name" maxlength="80" required>
+          </label>
+          <label>
+            <span>Email</span>
+            <input id="registerEmail" name="email" type="email" autocomplete="username" maxlength="254" required>
+          </label>
+          <label>
+            <span>Password</span>
+            <input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required>
+          </label>
+          <label>
+            <span>Confirm password</span>
+            <input name="password_confirmation" type="password" autocomplete="new-password" minlength="10" maxlength="128" required>
+          </label>
+          <button id="registerButton" class="primary wide" type="submit">Create account</button>
+        </form>
         <p id="loginStatus" class="login-status" hidden>Restoring saved session...</p>
         <p id="loginCloud" class="endpoint"></p>
+        <p id="loginNotice" class="form-notice" role="status" hidden></p>
         <p id="loginError" class="form-error" hidden></p>
-      </form>
+      </div>
     </section>
 
     <section id="appShell" class="app-shell" hidden>

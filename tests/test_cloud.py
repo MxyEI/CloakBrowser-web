@@ -1125,6 +1125,67 @@ def test_member_assignments_and_desktop_device_are_environment_scoped(cloud_app)
         assert updated_environment["assigned_membership_ids"] == []
 
 
+def test_client_self_registration_requires_team_assignment(cloud_app):
+    with TestClient(cloud_app) as owner_client, TestClient(cloud_app) as user_client:
+        owner_auth = register(owner_client, "owner@example.com", "Owner", "Owner Team")
+        registered = user_client.post(
+            "/api/client/register",
+            json={
+                "email": "self-registered@example.com",
+                "password": "new-account-password",
+                "display_name": "Self Registered",
+            },
+        )
+        assert registered.status_code == 201, registered.text
+        assert registered.json()["access_status"] == "pending"
+        assert registered.json()["user"]["email"] == "self-registered@example.com"
+        assert user_client.post(
+            "/api/client/register",
+            json={
+                "email": "self-registered@example.com",
+                "password": "new-account-password",
+                "display_name": "Self Registered",
+            },
+        ).status_code == 409
+
+        login_payload = {
+            "email": "self-registered@example.com",
+            "password": "new-account-password",
+            "organization_id": owner_auth["organization"]["id"],
+            "device_uid": str(uuid.uuid4()),
+            "device_name": "Registered Desktop",
+        }
+        pending_login = user_client.post("/api/client/login", json=login_payload)
+        assert pending_login.status_code == 403
+        assert pending_login.json()["detail"] == "account does not belong to this team"
+
+        added = owner_client.post(
+            "/api/members",
+            headers=csrf_headers(owner_auth),
+            json={"email": "self-registered@example.com", "role": "member"},
+        )
+        assert added.status_code == 201, added.text
+        membership = added.json()["member"]
+        environment = owner_client.post(
+            "/api/environments",
+            headers=csrf_headers(owner_auth),
+            json={
+                "name": "Registered User Account",
+                "storage_policy": "shared",
+                "assigned_membership_ids": [membership["id"]],
+                "config": {"fingerprint_seed": 86420},
+            },
+        )
+        assert environment.status_code == 201, environment.text
+
+        signed_in = user_client.post("/api/client/login", json=login_payload)
+        assert signed_in.status_code == 200, signed_in.text
+        assert signed_in.json()["organization"]["role"] == "member"
+        assert [
+            item["id"] for item in signed_in.json()["environments"]
+        ] == [environment.json()["environment"]["id"]]
+
+
 def test_owner_can_use_desktop_client_for_all_team_environments(client):
     owner_auth = register(client)
     environment = client.post(
@@ -1641,6 +1702,10 @@ def test_workspace_ui_polls_while_restoring_saved_session():
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert 'name="remember" type="checkbox" value="1" checked' in html
+    assert 'action="/api/register"' in html
+    assert 'name="password_confirmation"' in html
+    assert 'data-auth-mode="register"' in html
+    assert "selectAuthMode(button.dataset.authMode)" in javascript
     assert "currentState.signed_in || currentState.restoring_session" in javascript
 
 
@@ -1654,6 +1719,19 @@ def test_workspace_accepts_loopback_origin_alias_on_same_port(tmp_path):
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        captured_registration = {}
+
+        def fake_register(email, password, password_confirmation, display_name):
+            captured_registration.update(
+                {
+                    "email": email,
+                    "password": password,
+                    "password_confirmation": password_confirmation,
+                    "display_name": display_name,
+                }
+            )
+
+        app.register = fake_register
         with httpx.Client(trust_env=False) as client:
             alias_response = client.post(
                 f"http://127.0.0.1:{port}/api/login",
@@ -1670,11 +1748,79 @@ def test_workspace_accepts_loopback_origin_alias_on_same_port(tmp_path):
             )
             assert external_response.status_code == 403
             assert external_response.json()["error"] == "request origin is not allowed"
+
+            registered = client.post(
+                f"http://127.0.0.1:{port}/api/register",
+                headers={"Origin": f"http://localhost:{port}"},
+                data={
+                    "csrf_token": app.csrf_token,
+                    "email": "new@example.com",
+                    "password": "registration-password",
+                    "password_confirmation": "registration-password",
+                    "display_name": "New User",
+                },
+            )
+            assert registered.status_code == 303
+            assert captured_registration == {
+                "email": "new@example.com",
+                "password": "registration-password",
+                "password_confirmation": "registration-password",
+                "display_name": "New User",
+            }
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
         app.close()
+
+
+def test_workspace_registration_keeps_password_out_of_public_state(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    def fake_register_client_account(cloud_url, **payload):
+        captured.update({"cloud_url": cloud_url, **payload})
+        return {
+            "user": {
+                "id": str(uuid.uuid4()),
+                "email": payload["email"],
+                "display_name": payload["display_name"],
+            },
+            "access_status": "pending",
+        }
+
+    monkeypatch.setattr(
+        workspace_app,
+        "register_client_account",
+        fake_register_client_account,
+    )
+    app = workspace_app.WorkspaceApplication(
+        "https://cloud.example.com",
+        tmp_path / "workspace",
+    )
+    with pytest.raises(workspace_app.WorkspaceError, match="passwords do not match"):
+        app.register("new@example.com", "password-one", "password-two", "New User")
+
+    result = app.register(
+        " new@example.com ",
+        "registration-password",
+        "registration-password",
+        " New User ",
+    )
+    assert result["access_status"] == "pending"
+    assert captured == {
+        "cloud_url": "https://cloud.example.com",
+        "email": "new@example.com",
+        "password": "registration-password",
+        "display_name": "New User",
+    }
+    public_state = app.public_state()
+    assert public_state["signed_in"] is False
+    assert public_state["default_email"] == "new@example.com"
+    assert public_state["last_notice"] == workspace_app.ACCOUNT_PENDING_NOTICE
+    assert "registration-password" not in json.dumps(public_state)
+    app.close()
 
 
 def test_workspace_application_keeps_credentials_out_of_public_state(

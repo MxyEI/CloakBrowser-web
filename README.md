@@ -232,15 +232,17 @@ cloakbrowser client
 The client defaults to the deployed CloakBrowser Cloud service, opens a loopback
 Workspace UI, and accepts the email and password on that local page. The existing
 `workspace` command remains an alias, and `--cloud-url` or
-`CLOAKBROWSER_CLOUD_URL` can select another deployment. Members can start and
-stop assigned environments or create their own cloud-backed environment with a
-fingerprint and proxy. A Member's self-created environment is assigned to that
-Member. Owners can access all team environments, and an Owner-created environment
-starts unassigned so it can later be allocated from the cloud console. The server
-accepts only `backup` or `shared` storage and does not accept group, extension, or
-arbitrary membership IDs from the desktop client. Closing its browser uploads
-the complete encrypted profile through the same snapshot pipeline as an
-administrator-created environment.
+`CLOAKBROWSER_CLOUD_URL` can select another deployment. The Register tab creates
+a pending platform account without team access; an Owner or platform superadmin
+must add it to a team before it can sign in. Members can start and stop assigned
+environments or create their own cloud-backed environment with a fingerprint and
+proxy. A Member's self-created environment is assigned to that Member. Owners can
+access all team environments, and an Owner-created environment starts unassigned
+so it can later be allocated from the cloud console. The server accepts only
+`backup` or `shared` storage and does not accept group, extension, or arbitrary
+membership IDs from the desktop client. Closing its browser uploads the complete
+encrypted profile through the same snapshot pipeline as an administrator-created
+environment.
 
 The local page never receives the returned `cb_device_` credential, snapshot
 key, or unmasked cloud proxy. Password and new-proxy forms post directly to the

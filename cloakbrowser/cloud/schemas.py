@@ -132,6 +132,11 @@ class ClientLoginRequest(LoginRequest):
             raise ValueError("value must be a UUID") from exc
 
 
+class ClientRegisterRequest(LoginRequest):
+    password: str = Field(min_length=10, max_length=128)
+    display_name: str = Field(min_length=1, max_length=80)
+
+
 class OrganizationCreate(StrictModel):
     name: str = Field(min_length=1, max_length=100)
 

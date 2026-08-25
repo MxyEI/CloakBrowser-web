@@ -228,6 +228,56 @@ def load_workspace_session(root: Path, cloud_url: str) -> Optional[dict[str, str
     return {"device_token": token, "expires_at": expires_at}
 
 
+def _response_detail(response: httpx.Response) -> str:
+    try:
+        detail = response.json().get("detail", response.text)
+    except (AttributeError, ValueError):
+        return response.text
+    if isinstance(detail, list):
+        messages = [
+            str(item.get("msg", "")).strip()
+            for item in detail
+            if isinstance(item, dict) and item.get("msg")
+        ]
+        return "; ".join(messages) or "request validation failed"
+    return str(detail)
+
+
+def register_client_account(
+    cloud_url: str,
+    *,
+    email: str,
+    password: str,
+    display_name: str,
+) -> dict[str, Any]:
+    payload = {
+        "email": email,
+        "password": password,
+        "display_name": display_name,
+    }
+    try:
+        with httpx.Client(follow_redirects=False, timeout=15.0, trust_env=False) as client:
+            response = client.post(f"{cloud_url}/api/client/register", json=payload)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"cloud registration failed: {exc}") from exc
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"cloud registration failed ({response.status_code}): "
+            f"{_response_detail(response)}"
+        )
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("cloud registration returned an invalid response") from exc
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("user"), dict)
+        or result.get("access_status") != "pending"
+    ):
+        raise RuntimeError("cloud registration returned an invalid account")
+    return result
+
+
 def login_device(
     cloud_url: str,
     *,
@@ -252,11 +302,9 @@ def login_device(
     except httpx.HTTPError as exc:
         raise RuntimeError(f"cloud login failed: {exc}") from exc
     if response.status_code >= 400:
-        try:
-            detail = response.json().get("detail", response.text)
-        except (AttributeError, ValueError):
-            detail = response.text
-        raise RuntimeError(f"cloud login failed ({response.status_code}): {detail}")
+        raise RuntimeError(
+            f"cloud login failed ({response.status_code}): {_response_detail(response)}"
+        )
     try:
         result = response.json()
     except ValueError as exc:

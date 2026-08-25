@@ -48,17 +48,34 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 }
 .brand-mark.small { width: 36px; height: 36px; border-radius: 6px; font-size: 12px; }
 
-.login-form {
+.login-card {
   padding: 30px;
   border: 1px solid #d3d8d4;
   border-radius: 8px;
   background: #fff;
   box-shadow: 0 12px 36px rgb(26 38 31 / 8%);
 }
-.login-form h2 { margin: 0 0 24px; font-size: 20px; letter-spacing: 0; }
-.login-form label, .environment-form label { display: grid; gap: 7px; margin-bottom: 16px; }
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 24px;
+  border: 1px solid #c9cfcb;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.auth-tabs button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+  color: #59615c;
+}
+.auth-tabs button + button { border-left: 1px solid #c9cfcb; }
+.auth-tabs button[aria-selected="true"] { background: #e8f2ec; color: #155c3c; }
+.auth-form h2 { margin: 0 0 24px; font-size: 20px; letter-spacing: 0; }
+.auth-form label, .environment-form label { display: grid; gap: 7px; margin-bottom: 16px; }
 label > span, legend { color: #555e58; font-size: 12px; font-weight: 650; }
-.login-form .remember-row { display: flex; align-items: center; gap: 9px; }
+.auth-form .remember-row { display: flex; align-items: center; gap: 9px; }
 .remember-row input { width: 16px; min-height: 16px; margin: 0; accent-color: #176b46; }
 .login-status { margin: 14px 0 0; color: #59615c; font-size: 12px; text-align: center; }
 
@@ -93,6 +110,7 @@ button {
 .icon-button { width: 36px; height: 36px; min-height: 36px; padding: 0; border-color: #d3d8d4; background: #fff; color: #4e5651; }
 
 .endpoint { margin: 18px 0 0; color: #7a827c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; overflow-wrap: anywhere; }
+.form-notice { margin: 16px 0 0; color: #17623f; font-size: 13px; }
 .form-error { margin: 16px 0 0; color: #a43b30; font-size: 13px; }
 
 .topbar {
@@ -176,7 +194,7 @@ dialog::backdrop { background: rgb(28 35 31 / 48%); }
 @media (max-width: 720px) {
   .login-shell { grid-template-columns: minmax(0, 440px); align-content: center; gap: 28px; padding: 20px; }
   .login-brand { justify-content: center; }
-  .login-form { padding: 24px 20px; }
+  .login-card { padding: 24px 20px; }
   .topbar { height: auto; align-items: flex-start; padding: 14px 16px; }
   .account-copy { display: none; }
   .workspace-band { padding: 25px 16px 42px; }

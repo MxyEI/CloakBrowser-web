@@ -22,12 +22,14 @@ from .workspace_cli import (
     load_or_create_device_uid,
     load_workspace_session,
     login_device,
+    register_client_account,
     save_workspace_session,
 )
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 MAX_REQUEST_BYTES = 128 * 1024
+ACCOUNT_PENDING_NOTICE = "Account created. Team access pending."
 
 
 class WorkspaceError(RuntimeError):
@@ -69,6 +71,7 @@ class WorkspaceApplication:
         self._environments: list[dict[str, Any]] = []
         self._environment_states: dict[str, dict[str, Any]] = {}
         self._last_error = ""
+        self._last_notice = ""
         self._connection_message = ""
         self._last_refresh = 0.0
         self._remember_session = False
@@ -88,6 +91,7 @@ class WorkspaceApplication:
     def clear_error(self) -> None:
         with self._lock:
             self._last_error = ""
+            self._last_notice = ""
 
     def _report(self, message: str) -> None:
         with self._lock:
@@ -222,6 +226,8 @@ class WorkspaceApplication:
         if not email or not password:
             raise WorkspaceError("email and password are required")
         with self._operation_lock:
+            with self._lock:
+                self._last_notice = ""
             self._stop_runtime(revoke=True)
             clear_workspace_session(self.root)
             self._saved_session = None
@@ -252,6 +258,39 @@ class WorkspaceApplication:
                 self._saved_session = None
                 raise
 
+    def register(
+        self,
+        email: str,
+        password: str,
+        password_confirmation: str,
+        display_name: str,
+    ) -> dict[str, Any]:
+        email = email.strip()
+        display_name = display_name.strip()
+        if not email or not password or not display_name:
+            raise WorkspaceError("name, email, and password are required")
+        if password != password_confirmation:
+            raise WorkspaceError("passwords do not match")
+        with self._operation_lock:
+            with self._lock:
+                if self._api is not None:
+                    raise WorkspaceError("sign out before creating another account")
+                self._last_error = ""
+                self._last_notice = ""
+            result = register_client_account(
+                self.cloud_url,
+                email=email,
+                password=password,
+                display_name=display_name,
+            )
+            clear_workspace_session(self.root)
+            self._saved_session = None
+            with self._lock:
+                self.default_email = email
+                self._restoring_session = False
+                self._last_notice = ACCOUNT_PENDING_NOTICE
+            return result
+
     def logout(self) -> None:
         with self._operation_lock:
             self._stop_runtime(revoke=True)
@@ -261,6 +300,7 @@ class WorkspaceApplication:
                 self._remember_session = False
                 self._restoring_session = False
                 self._last_error = ""
+                self._last_notice = ""
 
     def close(self) -> None:
         with self._operation_lock:
@@ -355,6 +395,7 @@ class WorkspaceApplication:
                 "environment_states": dict(self._environment_states),
                 "connection_message": self._connection_message,
                 "last_error": self._last_error,
+                "last_notice": self._last_notice,
             }
 
 
@@ -598,7 +639,7 @@ class _WorkspaceRequestHandler(BaseHTTPRequestHandler):
             return
         path = self.path.split("?", 1)[0]
         try:
-            if path in {"/api/login", "/api/environments"}:
+            if path in {"/api/login", "/api/register", "/api/environments"}:
                 form = self._read_form()
                 if not self._form_mutation_allowed(form):
                     return
@@ -612,6 +653,20 @@ class _WorkspaceRequestHandler(BaseHTTPRequestHandler):
                         )
                     except Exception as exc:
                         self.app._set_error(exc)
+                    self._redirect()
+                    return
+                if path == "/api/register":
+                    try:
+                        self.app.register(
+                            form.get("email", ""),
+                            form.get("password", ""),
+                            form.get("password_confirmation", ""),
+                            form.get("display_name", ""),
+                        )
+                    except Exception as exc:
+                        self.app._set_error(exc)
+                        self._redirect("/?mode=register")
+                        return
                     self._redirect()
                     return
                 try:

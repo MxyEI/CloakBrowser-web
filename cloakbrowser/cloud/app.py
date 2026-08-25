@@ -53,6 +53,7 @@ from .schemas import (
     AgentTaskProof,
     AgentSelfLaunchRequest,
     ClientLoginRequest,
+    ClientRegisterRequest,
     DeviceEnvironmentCreate,
     EnvironmentCreate,
     EnvironmentUpdate,
@@ -881,6 +882,37 @@ def create_app(settings: Optional[CloudSettings] = None) -> FastAPI:
             ),
             "csrf_token": csrf_token(settings.secret_key, raw_token),
         }
+
+    @app.post("/api/client/register", status_code=status.HTTP_201_CREATED)
+    def client_register(
+        payload: ClientRegisterRequest,
+        db: DatabaseSession = Depends(get_db),
+    ) -> dict[str, Any]:
+        if payload.email in settings.superadmin_emails:
+            raise HTTPException(
+                status_code=403,
+                detail="platform administrator accounts cannot self-register",
+            )
+        if db.scalar(select(User.id).where(User.email == payload.email)):
+            raise HTTPException(
+                status_code=409,
+                detail="an account with this email already exists",
+            )
+        user = User(
+            email=payload.email,
+            display_name=payload.display_name,
+            password_hash=hash_password(payload.password),
+        )
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="an account with this email already exists",
+            ) from exc
+        return {"user": _user_json(user), "access_status": "pending"}
 
     @app.post("/api/client/login")
     def client_login(
